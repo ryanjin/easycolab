@@ -97,15 +97,15 @@ struct MainStudioView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openEasyColabGuide)) { _ in
             vm.openOnboardingGuide(step: 0)
         }
-        .alert(L("释放所有 Colab 实例？", "Release All Colab Instances?"), isPresented: $vm.showDisconnectConfirm) {
+        .alert(L("释放 EasyColab 实例？", "Release EasyColab Runtimes?"), isPresented: $vm.showDisconnectConfirm) {
             Button(L("取消", "Cancel"), role: .cancel) {}
             Button(L("释放", "Release"), role: .destructive) {
                 Task { await vm.disconnectRemoteColab() }
             }
         } message: {
             Text(L(
-                "账号下所有运行中的 Colab GPU 实例将被销毁，计费立即归零。",
-                "All active Colab GPU runtimes under your account will be terminated and CU billing will stop immediately."
+                "将断开当前服务，并释放此安装创建的 Colab 实例。",
+                "Disconnect the current service and release Colab runtimes created by this installation."
             ))
         }
     }
@@ -712,9 +712,7 @@ struct MainStudioView: View {
             HStack(spacing: 5) {
                 Image(systemName: "power")
                     .font(.caption)
-                Text(vm.activeVMCount > 0
-                     ? L("释放全部实例 (\(vm.activeVMCount) 台运行中)", "Release All Instances (\(vm.activeVMCount) Running)")
-                     : L("释放全部实例", "Release All Instances"))
+                Text(L("释放 EasyColab 实例", "Release EasyColab Runtimes"))
             }
             .frame(maxWidth: .infinity)
         }

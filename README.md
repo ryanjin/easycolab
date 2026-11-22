@@ -10,11 +10,13 @@
 
 ### 使用经过鉴权的公网入口
 
-可以在同一台 VM 上重新部署。如果从原版升级时 ComfyUI 正占用端口 `8188`，请先停止该 ComfyUI 进程，再启动新版。此后在同一台 VM 上热重启 EasyColab 时，它会尝试重新接管仍在运行的 ComfyUI 画布。点击「唤醒并部署」后，桌面客户端会生成管理密码，并按服务地址明文保存在本机设置中。打开 Gradio 或 ComfyUI 时，在浏览器的登录框填写用户名 `easycolab`，密码可从桌面端服务地址旁复制。手动运行 Notebook 时，在隐藏输入框设置 24 至 256 位管理密码（字母、数字、下划线或连字符），再将服务地址和密码填入桌面端。重开客户端后会自动取回该服务地址的管理密码。
+点击「唤醒并部署」时，客户端会生成管理密码。连接手动启动的 Notebook 时，请在隐藏输入框设置 24 至 256 位密码（英文字母、数字、下划线或连字符），然后在客户端填写 Notebook 输出的 **HTTPS 服务地址和同一密码**。在浏览器打开 Gradio 或 ComfyUI 时，以 `easycolab` 为用户名登录。OpenAI 和 Anthropic 兼容接口使用「API 网关」中的独立推理密钥。Linux 服务端使用 nginx 和 OpenSSL 保护两个公网入口，直接运行 `app.py` 时须安装这两个程序。
 
-OpenAI 和 Anthropic 兼容接口使用桌面端「API 网关」中的独立推理密钥。管理密码只交给可信的管理员。运行时使用 nginx 和 OpenSSL 保护两个隧道，支持媒体流和 WebSocket。直接启动 `app.py` 需要在 Linux 环境安装这两个程序，并在提示时输入管理密码。
+如果手动重用同一台 VM，旧版 ComfyUI 占用端口 `8188` 时，请先停止该进程再启动新版服务。之后可在同一台 VM 上重新部署并接回已有的 EasyColab 画布。
 
-Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Google 刷新令牌复制到 VM。与服务同用户运行的第三方节点可以读取它。仅安装可信节点，业务资料使用独立账号隔离。
+**已有实例与升级。** 客户端只会自动接管、保活或释放本次安装创建、且已向 Google 核实归属的实例。「释放实例」后显示的余额和计费速率涵盖整个 Google 账号。旧版创建的实例缺少新版归属记录，其他设备和 Notebook 的实例也可能继续计费。请在 Colab 网页端查看这些会话，在完成工作后手动释放。
+
+**Drive 与生成文件。** 需要持久保存模型、ComfyUI 节点或作品时，请在官方 Notebook 中授权并使用 Colab 原生 Drive 挂载。免网页部署将 Google OAuth 刷新令牌留在设备上。未挂载 Drive 时，服务端文件位于临时 VM 磁盘，客户端仍可下载生成结果。升级前若曾启用旧版 EasyColab 的 rclone 云盘挂载，请先保存需要保留的文件，再撤销旧的 Google 授权并换用新 VM。新版客户端在部署时检测到旧版凭据配置或挂载会停止启动。
 
 ---
 
@@ -31,7 +33,8 @@ Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Go
      - 支持文生有声视频、首帧图生视频、首尾帧过渡控镜，原生输出 `24 FPS` 画面 + `32 kHz` 立体声音轨。
      - **G4 176GB 双主干内存热备加速**：自动将 `32B 文本编码器` 与 `33B DiT 主干` 常驻高速 DDR5 内存，同提示词连抽 `0 ms` 瞬回，修改新提示词整块 PCIe 换入解析仅需约 `8～12 秒`。
   2. **`ComfyUI 节点工作台` · 云盘持久化 + 4 套零基础预置工作流包**
-     - 一键部署 ComfyUI + Manager 并开通免费 Cloudflare HTTPS 加密隧道，所有 `custom_nodes`、`models` 与 `workflows` 自动软链/同步至 Google Drive。
+     - 一键部署 ComfyUI + Manager 并开通免费 Cloudflare HTTPS 加密隧道，挂载原生 Google Drive 后，`custom_nodes`、`models` 与 `workflows` 可自动软链或同步到云盘。
+     - ComfyUI-Manager 启动时会将旧版 EasyColab 设置的 `security_level = weak` 恢复为 `normal`。公网画布中的节点安装遵循 Manager 的安全级别。
      - 内置 **万相 Wan2.2 14B**、**MiniMax-H3 Turbo**、**LTX-2.3 (22B)**、**混元 HunyuanVideo 1.5** 四套「一键配齐模型 + 节点指引」的图生视频与首尾帧运镜工作流。
   3. **`Qwen3.8-27B (UD-Q4_K_M + MTP 投机解码 / BF16)` · 100 tok/s 视觉对话与双协议网关**
      - 支持最高 `256K` 上下文、长思维链推理、多模态看图反推提示词。
@@ -47,7 +50,7 @@ Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Go
 - **操作系统**：
   - **macOS**：macOS 13.0 (Ventura) 或更高版本（推荐 Apple Silicon / macOS Sonoma & Sequoia）
   - **Windows**：Windows 10 (1903+) 或 Windows 11 64 位 (x64)
-  - **Linux**：主流 64 位桌面发行版（Ubuntu 22.04+ / Debian 12+ / Arch Linux / Fedora 等，需 Python 3.10+ 与 FFmpeg）
+  - **Linux**：主流 64 位桌面发行版（Ubuntu 22.04+ / Debian 12+ / Arch Linux / Fedora 等，需 Python 3.12+ 与 FFmpeg）
   - **iOS / iPadOS**：iOS 16.0 或更高版本（支持 Mac 本地源码真机签名安装或通过 AltStore / SideStore / Sideloadly / TrollStore 侧载 `.ipa`）
   - **Android**：Android 8.0 (API 26) 或更高版本（支持从 GitHub Releases 下载签名 `.apk` 直接安装，或从 `android_app/` 源码一键编译）
 - **云端账号**：开通了 **Google Colab Pro / Pro+ / Google AI Ultra**（拥有可用 CU 计算单元）的 Google 账号；免费版用户请使用下方「Google Colab 官方网页端运行 `.ipynb`」。
@@ -57,7 +60,7 @@ Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Go
 ### macOS 客户端
 
 #### 方式一：本地一行命令编译运行（推荐，无 Gatekeeper 拦截）
-只需系统装有 Xcode Command Line Tools（若未安装可执行 `xcode-select --install`）：
+编译需要 Xcode Command Line Tools（可通过 `xcode-select --install` 安装）。免网页绑定和部署另需 Python 3.12 或更高版本。
 
 ```bash
 git clone https://github.com/wy51ai/easycolab.git
@@ -85,7 +88,7 @@ xattr -cr /Applications/EasyColab.app
 3. 如遇 Windows SmartScreen 提示 *“Windows 已保护你的电脑”*，点击 **「更多信息」 -> 「仍要运行」** 即可。
 
 #### 方式二：Windows 本地一键打包独立 `.exe`
-若本机已安装 Python 3.10～3.13（64 位），在仓库根目录可直接一键创建隔离虚拟环境并编译生成 `dist\EasyColab\EasyColab.exe` 与 `EasyColab-Windows-x64.zip`：
+若本机已安装 Python 3.12～3.13（64 位），在仓库根目录可直接一键创建隔离虚拟环境并编译生成 `dist\EasyColab\EasyColab.exe` 与 `EasyColab-Windows-x64.zip`：
 
 ```bat
 REM 双击或在 CMD 中运行：
@@ -189,17 +192,17 @@ bash android_app/install_release_android.sh
 ### Google Colab 官方网页端运行（适合 Colab 免费版 / 浏览器用户）
 1. 打开 [Google Colab](https://colab.research.google.com/)，上传本仓库根目录下的 `EasyColab_Server.ipynb`（或在客户端引导页点击「导出 / 定位 `.ipynb` 笔记本」）。
 2. 在 Colab 菜单栏选择 `代码执行程序 -> 更改运行时类型`，选择 `G4` / `A100` / `L4` GPU 并按顺序运行单元格。
-3. 将输出的 `https://xxxx.gradio.live` 链接粘贴至桌面客户端左侧服务地址栏点击「连接」即可。
+3. 将输出的 `https://xxxx.gradio.live` 链接填入客户端的服务地址栏，再填写本次 Notebook 设置的管理密码并点击「连接」。
 
 ---
 
 ## 隐私与安全建议
 
-1. **录屏 / 截图防泄密开关**：在左侧「服务地址」输入框旁提供了 **打码保护开关**（macOS 为眼睛图标，Windows 为「打码」按钮）。在录制教程、直播或截图分享前，请开启打码隐藏你的 `*.gradio.live` 与 `*.trycloudflare.com` 临时公网隧道域名及账号邮箱，防止他人通过链接蹭用你的云端 GPU。
-2. **推理密钥**：外部工具通过 Bearer 或 `x-api-key` 提交 API 网关面板中的推理密钥。
-3. **本地凭证与数据目录**：
-   - 桥接程序读取本机 `~/.config/colab-cli/token.json`。无浏览器挂载 Drive 时，刷新令牌也会写入云端实例的 rclone 配置。
-   - Windows 客户端本地配置文件位于 `%LOCALAPPDATA%\EasyColab\settings.json`（Linux 为 `~/.config/EasyColab/settings.json`），成片默认保存于 `%USERPROFILE%\Videos\EasyColab`（Linux 为 `~/Videos/EasyColab`）。
+- **本机凭据。** macOS 原生客户端把各服务地址的管理密码、推理密钥和 Hugging Face 令牌保存在「钥匙串」中。升级时，旧设置中的对应条目会在成功迁移后移除。桌面桥接使用的 `google-colab-cli` 0.8.0 将 Google OAuth 凭据保存在操作系统的凭据库中。0.7.5 使用仅当前用户可读写的令牌文件。iOS / iPadOS 使用钥匙串，Android 使用 Android Keystore 中的密钥加密保存应用凭据。
+- **Windows 与 Linux。** Qt 客户端的管理密码、推理密钥以及填写的 Hugging Face 令牌以明文保存在用户的 `settings.json` 中。Windows 路径为 `%LOCALAPPDATA%\EasyColab\settings.json`，Linux 路径为 `~/.config/EasyColab/settings.json`。请把备份和访问权限限定在可信用户范围内。
+- **模型目录查询。** 客户端查询已连接的 EasyColab 服务时，将 Hugging Face 令牌放入 HTTPS 请求头。向上游查询需要令牌的模型时，客户端和服务端只向 `https://huggingface.co` 提交认证。第三方镜像仅用于匿名目录查询。
+- **桌面媒体下载。** 客户端只接受允许的媒体扩展名，并把文件保存在本地输出目录中。服务端返回的带目录成分的文件名会被拒绝。
+- **分享屏幕。** 服务地址旁的打码开关可隐藏临时隧道地址和账号邮箱。管理密码仅供管理员使用，外部推理工具应使用网关推理密钥。
 
 ---
 

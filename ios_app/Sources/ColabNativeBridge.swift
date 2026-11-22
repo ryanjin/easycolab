@@ -42,6 +42,8 @@ private struct PendingPKCEState: Codable {
 }
 
 private struct RuntimeSessionRecord: Codable {
+    var notebookHash: String
+    var highMemory: Bool
     var name: String
     var token: String
     var url: String
@@ -122,7 +124,7 @@ actor ColabNativeBridge {
     }
 
     private var fallbackCredsFile: URL { supportDir.appendingPathComponent("oauth_creds.json") }
-    private var sessionRecordFile: URL { supportDir.appendingPathComponent("colab_session.json") }
+    private let ownedSessionKey = "owned-runtime-v1"
     private var customOAuthFile: URL { supportDir.appendingPathComponent("custom_oauth_client.json") }
     private var pkceFile: URL { supportDir.appendingPathComponent("pkce_verifier.txt") }
 
@@ -167,23 +169,23 @@ actor ColabNativeBridge {
 
     // MARK: - Keychain & Local Credential Storage
 
-    private func saveCredentials(_ creds: StoredOAuthCredentials) {
-        guard let data = try? JSONEncoder().encode(creds) else { return }
-        // Save to iOS Keychain (encrypted hardware-backed credential storage)
+    private func saveCredentials(_ creds: StoredOAuthCredentials) throws {
+        let data = try JSONEncoder().encode(creds)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount
         ]
-        SecItemDelete(query as CFDictionary)
-        var addQuery = query
-        addQuery[kSecValueData as String] = data
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        // Always mirror to protected app support file for Simulator / ad-hoc environments without keychain entitlement
-        if status != errSecSuccess || true {
-            try? data.write(to: fallbackCredsFile, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
         }
+        guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+        try? FileManager.default.removeItem(at: fallbackCredsFile)
     }
 
     private func loadCredentials() -> StoredOAuthCredentials? {
@@ -198,10 +200,12 @@ actor ColabNativeBridge {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecSuccess, let data = result as? Data,
            let creds = try? JSONDecoder().decode(StoredOAuthCredentials.self, from: data) {
+            try? FileManager.default.removeItem(at: fallbackCredsFile)
             return creds
         }
-        if let data = try? Data(contentsOf: fallbackCredsFile),
+        if status == errSecItemNotFound, let data = try? Data(contentsOf: fallbackCredsFile),
            let creds = try? JSONDecoder().decode(StoredOAuthCredentials.self, from: data) {
+            guard (try? saveCredentials(creds)) != nil else { return nil }
             return creds
         }
         return nil
@@ -215,23 +219,22 @@ actor ColabNativeBridge {
         ]
         SecItemDelete(query as CFDictionary)
         try? FileManager.default.removeItem(at: fallbackCredsFile)
-        try? FileManager.default.removeItem(at: sessionRecordFile)
+        StudioCredentials.write("", for: ownedSessionKey)
         try? FileManager.default.removeItem(at: pkceFile)
         pendingPKCEVerifier = nil
         pendingRedirectURI = nil
     }
 
     private func loadSessionRecord() -> RuntimeSessionRecord? {
-        guard let data = try? Data(contentsOf: sessionRecordFile) else { return nil }
+        let data = Data(StudioCredentials.read(ownedSessionKey).utf8)
         return try? JSONDecoder().decode(RuntimeSessionRecord.self, from: data)
     }
 
-    private func saveSessionRecord(_ rec: RuntimeSessionRecord?) {
-        guard let rec, let data = try? JSONEncoder().encode(rec) else {
-            try? FileManager.default.removeItem(at: sessionRecordFile)
-            return
-        }
-        try? data.write(to: sessionRecordFile, options: .atomic)
+    @discardableResult
+    private func saveSessionRecord(_ rec: RuntimeSessionRecord?) -> Bool {
+        guard let rec else { return StudioCredentials.write("", for: ownedSessionKey) }
+        guard let data = try? JSONEncoder().encode(rec) else { return false }
+        return StudioCredentials.write(String(decoding: data, as: UTF8.self), for: ownedSessionKey)
     }
 
     // MARK: - Google OAuth2 PKCE Flow (Native ASWebAuthenticationSession + Manual Fallback)
@@ -397,7 +400,7 @@ actor ColabNativeBridge {
                 scopes: scopeStr.components(separatedBy: " "),
                 email: email
             )
-            saveCredentials(creds)
+            try saveCredentials(creds)
             return await fetchAuthStatus()
         } catch {
             return NativeAuthStatus(ok: false, loggedIn: false, email: "", activeAssignments: 0, error: error.localizedDescription)
@@ -443,7 +446,7 @@ actor ColabNativeBridge {
         if creds.email.isEmpty {
             creds.email = await fetchUserEmail(accessToken: newToken)
         }
-        saveCredentials(creds)
+        try saveCredentials(creds)
         return creds
     }
 
@@ -555,24 +558,33 @@ actor ColabNativeBridge {
         }
     }
 
-    private func listAssignments() async throws -> [[String: Any]] {
-        let res = try await colabTunnelRequest(path: "/tun/m/assignments", timeout: 25)
-        return (res["assignments"] as? [[String: Any]]) ?? []
+    private func ownedSession() async throws -> RuntimeSessionRecord? {
+        guard var record = loadSessionRecord() else { return nil }
+        var query = [URLQueryItem(name: "nbh", value: record.notebookHash),
+                     URLQueryItem(name: "variant", value: "GPU"),
+                     URLQueryItem(name: "accelerator", value: record.accelerator)]
+        if record.highMemory { query.append(URLQueryItem(name: "shape", value: "hm")) }
+        let result = try await colabTunnelRequest(path: "/tun/m/assign", method: "GET", queryItems: query)
+        guard let endpoint = result["endpoint"] as? String, endpoint == record.endpoint,
+              let proxy = result["runtimeProxyInfo"] as? [String: Any],
+              let token = proxy["token"] as? String, let url = proxy["url"] as? String,
+              !token.isEmpty, StudioCredentials.origin(URL(string: url)) != nil else { return nil }
+        record.token = token
+        record.url = url
+        return record
     }
 
-    private func unassignEndpoint(_ endpoint: String) async {
-        guard !endpoint.isEmpty else { return }
-        do {
-            let getResp = try await colabTunnelRequest(path: "/tun/m/unassign/\(endpoint)", method: "GET", timeout: 20)
-            if let xsrf = getResp["token"] as? String, !xsrf.isEmpty {
-                _ = try await colabTunnelRequest(
-                    path: "/tun/m/unassign/\(endpoint)",
-                    method: "POST",
-                    extraHeaders: ["X-Goog-Colab-Token": xsrf],
-                    timeout: 25
-                )
-            }
-        } catch {}
+    private func unassignEndpoint(_ endpoint: String) async throws {
+        guard !endpoint.isEmpty else { throw ColabBridgeError.invalidResponse("Missing runtime endpoint") }
+        let getResp = try await colabTunnelRequest(path: "/tun/m/unassign/\(endpoint)", method: "GET", timeout: 20)
+        if let xsrf = getResp["token"] as? String, !xsrf.isEmpty {
+            _ = try await colabTunnelRequest(
+                path: "/tun/m/unassign/\(endpoint)",
+                method: "POST",
+                extraHeaders: ["X-Goog-Colab-Token": xsrf],
+                timeout: 25
+            )
+        } else { throw ColabBridgeError.invalidResponse("Missing runtime release token") }
     }
 
     func stopAll() async -> NativeAuthStatus {
@@ -580,40 +592,35 @@ actor ColabNativeBridge {
             return NativeAuthStatus(ok: false, loggedIn: false, email: "", activeAssignments: 0, error: "Not logged in")
         }
         var stoppedCount = 0
-        if let rec = loadSessionRecord() {
-            // Trigger quick ComfyUI Google Drive sync before shutdown if running
-            _ = try? await executeCodeOnKernel(
-                session: rec,
-                code: """
-                import urllib.request
-                for _p in (27860, 7860):
-                    try:
-                        urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{_p}/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
-                        break
-                    except Exception:
-                        pass
-                """,
-                timeout: 15
-            )
-            await unassignEndpoint(rec.endpoint)
-            saveSessionRecord(nil)
-            stoppedCount += 1
-        }
-
-        if let assignments = try? await listAssignments() {
-            for item in assignments {
-                if let ep = item["endpoint"] as? String, !ep.isEmpty {
-                    await unassignEndpoint(ep)
-                    stoppedCount += 1
-                }
+        do {
+            if let rec = try await ownedSession() {
+                // Trigger quick ComfyUI Google Drive sync before shutdown if running
+                _ = try? await executeCodeOnKernel(
+                    session: rec,
+                    code: """
+                    import urllib.request
+                    for _p in (27860, 7860):
+                        try:
+                            urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{_p}/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
+                            break
+                        except Exception:
+                            pass
+                    """,
+                    timeout: 15
+                )
+                try await unassignEndpoint(rec.endpoint)
+                saveSessionRecord(nil)
+                stoppedCount += 1
             }
+        } catch {
+            return NativeAuthStatus(ok: false, loggedIn: true, email: "", activeAssignments: 0, error: error.localizedDescription)
         }
 
         var status = await fetchAuthStatus()
         let rate = status.burnRateHourly ?? 0.0
         status.message = L(
-            "已彻底释放全部云端实例 (\(stoppedCount) 台)！当前计费速率: \(String(format: "%.2f", rate)) CU/h",
-            "Terminated all cloud instances (\(stoppedCount)). Current burn rate: \(String(format: "%.2f", rate)) CU/h"
+            "已彻底释放本机创建的实例 (\(stoppedCount) 台)！当前计费速率: \(String(format: "%.2f", rate)) CU/h",
+            "Terminated runtimes created on this device (\(stoppedCount)). Current burn rate: \(String(format: "%.2f", rate)) CU/h"
         )
         return status
     }
@@ -628,8 +635,8 @@ actor ColabNativeBridge {
         let gpuDesc = accel == "G4" ? "G4 (RTX PRO 6000 · 96GB)" : accel
         onLog(L("正在向 Google Colab 申请分配 \(gpuDesc) 实例...", "Requesting \(gpuDesc) instance from Google Colab..."))
 
+        let nbh = Self.webSafeNotebookHash()
         func performAssign(highMem: Bool) async throws -> [String: Any] {
-            let nbh = Self.webSafeNotebookHash()
             var q: [URLQueryItem] = [
                 URLQueryItem(name: "nbh", value: nbh),
                 URLQueryItem(name: "variant", value: "GPU"),
@@ -639,8 +646,8 @@ actor ColabNativeBridge {
                 q.append(URLQueryItem(name: "shape", value: "hm"))
             }
             let getResp = try await colabTunnelRequest(path: "/tun/m/assign", method: "GET", queryItems: q, timeout: 60)
-            if getResp["runtimeProxyInfo"] != nil {
-                return getResp
+            guard getResp["runtimeProxyInfo"] == nil else {
+                throw ColabBridgeError.invalidResponse(L("分配请求返回了已有实例，已取消。", "Allocation returned an existing runtime. Deployment cancelled."))
             }
             guard let xsrf = getResp["token"] as? String, !xsrf.isEmpty else {
                 throw ColabBridgeError.invalidResponse(L("未能获取实例分配令牌，请检查账号 CU 余额", "Failed to obtain assignment token. Check your CU balance."))
@@ -655,20 +662,23 @@ actor ColabNativeBridge {
         }
 
         let resp: [String: Any]
+        var highMemory = useHighMem
         do {
             resp = try await performAssign(highMem: useHighMem)
         } catch ColabBridgeError.httpError(let code, _) where code == 400 && useHighMem {
+            highMemory = false
             resp = try await performAssign(highMem: false)
         }
 
         guard let endpoint = resp["endpoint"] as? String,
               let proxy = resp["runtimeProxyInfo"] as? [String: Any],
-              let proxyToken = proxy["token"] as? String,
-              let proxyURL = proxy["url"] as? String, !proxyURL.isEmpty else {
+              let proxyToken = proxy["token"] as? String, !proxyToken.isEmpty,
+              let proxyURL = proxy["url"] as? String, StudioCredentials.origin(URL(string: proxyURL)) != nil else {
             throw ColabBridgeError.invalidResponse(L("分配失败：账号可能无可用付费 CU 或当前 GPU 缺货，可尝试切换 L4 / A100", "Allocation failed: check paid CU balance or try switching to L4 / A100."))
         }
 
         let rec = RuntimeSessionRecord(
+            notebookHash: nbh, highMemory: highMemory,
             name: "easycolab",
             token: proxyToken,
             url: proxyURL,
@@ -677,7 +687,10 @@ actor ColabNativeBridge {
             kernelId: nil,
             sessionId: nil
         )
-        saveSessionRecord(rec)
+        guard saveSessionRecord(rec) else {
+            try await unassignEndpoint(rec.endpoint)
+            throw ColabBridgeError.invalidResponse("Could not securely persist the runtime record")
+        }
         onLog(L("成功分配 \(accel) 云端虚拟机！正在等待容器内核就绪...", "Allocated \(accel) cloud VM! Waiting for Jupyter kernel..."))
         return rec
     }
@@ -749,31 +762,7 @@ actor ColabNativeBridge {
         }
     }
 
-    private func buildRcloneDriveConf() async -> String? {
-        guard let creds = try? await validAccessToken(), !creds.refreshToken.isEmpty else { return nil }
-        let driveScope = creds.scopes.contains(where: { $0.hasSuffix("/drive") })
-            ? "drive"
-            : (creds.scopes.contains(where: { $0.contains("drive.file") }) ? "drive.file" : "")
-        guard !driveScope.isEmpty else { return nil }
-        let tokObj: [String: String] = [
-            "access_token": creds.accessToken,
-            "token_type": "Bearer",
-            "refresh_token": creds.refreshToken
-        ]
-        guard let tokData = try? JSONSerialization.data(withJSONObject: tokObj),
-              let tokStr = String(data: tokData, encoding: .utf8) else { return nil }
-        return [
-            "[easycolab_gdrive]",
-            "type = drive",
-            "client_id = \(creds.clientId)",
-            "client_secret = \(creds.clientSecret)",
-            "scope = \(driveScope)",
-            "token = \(tokStr)",
-            ""
-        ].joined(separator: "\n")
-    }
-
-    private func resolveOrStartKernelId(session: RuntimeSessionRecord, cleanExtra: Bool = false) async throws -> String {
+    private func resolveOrStartKernelId(session: RuntimeSessionRecord) async throws -> String {
         let base = session.url.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         var comps = URLComponents(string: "\(base)/api/kernels")!
         comps.queryItems = [
@@ -793,22 +782,7 @@ actor ColabNativeBridge {
            let arr = try? JSONSerialization.jsonObject(with: lData) as? [[String: Any]],
            !arr.isEmpty {
             let ids = arr.compactMap { $0["id"] as? String }
-            if let primary = (session.kernelId != nil && ids.contains(session.kernelId!)) ? session.kernelId! : ids.first {
-                if cleanExtra {
-                    for extra in ids where extra != primary {
-                        var delComps = URLComponents(string: "\(base)/api/kernels/\(extra)")!
-                        delComps.queryItems = comps.queryItems
-                        var delReq = URLRequest(url: delComps.url!)
-                        delReq.httpMethod = "DELETE"
-                        delReq.timeoutInterval = 6
-                        delReq.setValue("colab-cli", forHTTPHeaderField: "X-Colab-Client-Agent")
-                        delReq.setValue(session.token, forHTTPHeaderField: "X-Colab-Runtime-Proxy-Token")
-                        delReq.setValue("Bearer \(session.token)", forHTTPHeaderField: "Authorization")
-                        _ = try? await URLSession.shared.data(for: delReq)
-                    }
-                }
-                return primary
-            }
+            if let owned = session.kernelId, ids.contains(owned) { return owned }
         }
 
         // Start a new python3 kernel
@@ -867,7 +841,7 @@ actor ColabNativeBridge {
         timeout: TimeInterval,
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async throws -> [String] {
-        let kernelId = try await resolveOrStartKernelId(session: session, cleanExtra: true)
+        let kernelId = try await resolveOrStartKernelId(session: session)
         let sessionId = session.sessionId ?? UUID().uuidString.lowercased()
         var updated = session
         updated.kernelId = kernelId
@@ -987,41 +961,19 @@ actor ColabNativeBridge {
 
     func wakeAndDeploy(
         gpuType: String,
-        appPyData: Data,
+        appPyData: Data, runtimeAuth: Data, bootstrap: Data, password: String,
         onLog: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         _ = try await validAccessToken()
         let requestedAccel = (["G4", "H100", "A100", "L4", "T4"].first { $0.caseInsensitiveCompare(gpuType) == .orderedSame } ?? "G4").uppercased()
 
         onLog(L("正在检查账号下已有的 Colab 云端实例...", "Checking active Colab cloud instances on your account..."))
-        let assignments = (try? await listAssignments()) ?? []
-        var activeSession = loadSessionRecord()
-
-        // Adopt or refresh proxy token from cloud assignments
-        if let firstAssign = assignments.first,
-           let ep = firstAssign["endpoint"] as? String,
-           let acc = firstAssign["accelerator"] as? String,
-           let proxy = firstAssign["runtimeProxyInfo"] as? [String: Any],
-           let tok = proxy["token"] as? String,
-           let url = proxy["url"] as? String {
-            if activeSession == nil || activeSession?.endpoint == ep {
-                activeSession = RuntimeSessionRecord(
-                    name: "easycolab",
-                    token: tok,
-                    url: url,
-                    endpoint: ep,
-                    accelerator: acc,
-                    kernelId: activeSession?.kernelId,
-                    sessionId: activeSession?.sessionId
-                )
-                saveSessionRecord(activeSession)
-            }
-        }
+        var activeSession = try await ownedSession()
 
         if let cur = activeSession {
             if cur.accelerator.uppercased() != requestedAccel {
                 onLog(L("当前实例型号为 [\(cur.accelerator)]，正在释放并切换为 [\(requestedAccel)]...", "Current runtime is [\(cur.accelerator)]; releasing and switching to [\(requestedAccel)]..."))
-                await unassignEndpoint(cur.endpoint)
+                try await unassignEndpoint(cur.endpoint)
                 saveSessionRecord(nil)
                 activeSession = nil
             } else {
@@ -1029,7 +981,7 @@ actor ColabNativeBridge {
                 let ok = await waitForRuntimeReady(cur, timeoutSeconds: 15)
                 if !ok {
                     onLog(L("旧实例已过期，正在自动清理并分配全新实例...", "Previous runtime expired; cleaning up and allocating a new VM..."))
-                    await unassignEndpoint(cur.endpoint)
+                    try await unassignEndpoint(cur.endpoint)
                     saveSessionRecord(nil)
                     activeSession = nil
                 }
@@ -1061,124 +1013,21 @@ actor ColabNativeBridge {
         }
         if let err = lastUploadErr { throw err }
 
-        if let rcloneConf = await buildRcloneDriveConf(),
-           let rcData = rcloneConf.data(using: .utf8) {
-            try? await uploadFileToColab(session: targetSession, data: rcData, remotePath: "content/.easycolab_rclone.conf")
-        }
-
-        onLog(L("正在云端配置 Google Drive 持久化、多模型引擎并启动隧道 (约需 40~90 秒)...", "Configuring Google Drive persistence, multi-model engine & public tunnel (~40–90s)..."))
-
-        let bootCode = #"""
-import os, sys, time, re, shutil, subprocess
-
-rc_stage = "/content/.easycolab_rclone.conf"
-if os.path.exists(rc_stage):
-    rc_dir = os.path.expanduser("~/.config/rclone")
-    os.makedirs(rc_dir, mode=0o700, exist_ok=True)
-    rc_dst = os.path.join(rc_dir, "rclone.conf")
-    shutil.move(rc_stage, rc_dst)
-    os.chmod(rc_dst, 0o600)
-
-if os.path.exists(os.path.expanduser("~/.config/rclone/rclone.conf")):
-    if not shutil.which("rclone"):
-        subprocess.run(
-            ["bash", "-lc", "curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip && unzip -q -o /tmp/rclone.zip -d /tmp && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone && rm -rf /tmp/rclone*"],
-            check=False,
-        )
-    if shutil.which("rclone") and not os.path.ismount("/content/drive/MyDrive"):
-        subprocess.run(["rclone", "mkdir", "easycolab_gdrive:EasyColab_Drive"], check=False)
-        if os.path.exists("/dev/fuse") and (shutil.which("fusermount3") or shutil.which("fusermount")):
-            os.makedirs("/content/drive/MyDrive", exist_ok=True)
-            subprocess.Popen(
-                [
-                    "rclone", "mount", "easycolab_gdrive:EasyColab_Drive", "/content/drive/MyDrive",
-                    "--vfs-cache-mode", "writes",
-                    "--vfs-write-back", "3s",
-                    "--dir-cache-time", "15s",
-                    "--drive-chunk-size", "64M",
-                    "--buffer-size", "32M",
-                    "--allow-non-empty",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for _ in range(10):
-                if os.path.ismount("/content/drive/MyDrive"):
-                    print("已通过 Google OAuth 自动挂载 Google Drive (/content/drive/MyDrive)！", flush=True)
-                    break
-                time.sleep(0.5)
-            else:
-                try:
-                    if not os.listdir("/content/drive/MyDrive"):
-                        os.rmdir("/content/drive/MyDrive")
-                except Exception:
-                    pass
-
-if not os.path.exists("/content/DiffSynth-Studio"):
-    print("正在克隆 DiffSynth-Studio...", flush=True)
-    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/modelscope/DiffSynth-Studio.git", "/content/DiffSynth-Studio"], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "bitsandbytes", "huggingface_hub", "hf_transfer", "qwen-vl-utils", "einops", "kernels>=0.17.2,<0.18.0", "av", "gradio", "modelscope", "imageio", "imageio-ffmpeg", "scipy", "soundfile", "librosa"], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "fla-core", "flash-linear-attention"], check=False)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--only-binary=:all:", "causal-conv1d"], check=False)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "/content/DiffSynth-Studio"], check=True)
-else:
-    try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        import kernels
-    except Exception:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "einops", "kernels>=0.17.2,<0.18.0"], check=False)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", "fla-core", "flash-linear-attention"], check=False)
-
-subprocess.run(["pkill", "-f", "python.*/content/app.py"], check=False)
-subprocess.run(["pkill", "-f", "llama-server"], check=False)
-time.sleep(1)
-
-log_path = "/content/easycolab_server.log"
-if os.path.exists(log_path):
-    os.remove(log_path)
-
-with open(log_path, "w") as out_f:
-    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", stdout=out_f, stderr=subprocess.STDOUT)
-
-url_re = re.compile(r"https://[a-zA-Z0-9.-]+\.gradio\.live")
-found_url = None
-for _ in range(90):
-    time.sleep(2)
-    if os.path.exists(log_path):
-        txt = open(log_path, "r", errors="replace").read()
-        m = url_re.search(txt)
-        if m:
-            found_url = m.group(0)
-            break
-
-if found_url:
-    print("WAKE_URL:" + found_url, flush=True)
-else:
-    tail = open(log_path, "r", errors="replace").read()[-600:] if os.path.exists(log_path) else "no log"
-    print("WAKE_ERROR: 启动超时，日志尾部: " + tail, flush=True)
-"""#
-
-        let lines: [String]
-        do {
-            lines = try await executeCodeOnKernel(session: targetSession, code: bootCode, timeout: 300) { line in
-                if !line.hasPrefix("WAKE_URL:") {
-                    onLog(line.replacingOccurrences(of: "WAKE_LOG: ", with: ""))
-                }
-            }
-        } catch {
-            var freshKernelSession = targetSession
-            freshKernelSession.kernelId = nil
-            freshKernelSession.sessionId = nil
-            saveSessionRecord(freshKernelSession)
-            lines = try await executeCodeOnKernel(session: freshKernelSession, code: bootCode, timeout: 300) { line in
-                if !line.hasPrefix("WAKE_URL:") {
-                    onLog(line.replacingOccurrences(of: "WAKE_LOG: ", with: ""))
-                }
-            }
+        try await uploadFileToColab(session: targetSession, data: runtimeAuth, remotePath: "content/runtime_auth.py")
+        try await uploadFileToColab(session: targetSession, data: bootstrap, remotePath: "content/mobile_bootstrap.py")
+        let stageName = ".easycolab-admin-" + UUID().uuidString
+        try await uploadFileToColab(session: targetSession, data: Data(password.utf8), remotePath: "content/" + stageName)
+        let bootCode = "import runpy; runpy.run_path('/content/mobile_bootstrap.py')['start']('/content/\(stageName)')"
+        let lines = try await executeCodeOnKernel(session: targetSession, code: bootCode, timeout: 300) { line in
+            if !line.hasPrefix("WAKE_URL:") { onLog(line) }
         }
 
         if let urlLine = lines.first(where: { $0.hasPrefix("WAKE_URL:") }) {
-            return String(urlLine.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let address = String(urlLine.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard address.range(of: #"^https://[A-Za-z0-9-]+\.gradio\.live$"#, options: .regularExpression) != nil else {
+                throw ColabBridgeError.invalidResponse("Invalid tunnel address")
+            }
+            return address
         }
         if let errLine = lines.first(where: { $0.hasPrefix("WAKE_ERROR:") }) {
             throw ColabBridgeError.kernelTimeout(errLine)
@@ -1190,31 +1039,13 @@ else:
         guard loadCredentials() != nil else {
             return NativeAuthStatus(ok: true, loggedIn: false, email: "", activeAssignments: 0)
         }
-        if let assignments = try? await listAssignments(), let first = assignments.first,
-           let ep = first["endpoint"] as? String,
-           let acc = first["accelerator"] as? String,
-           let proxy = first["runtimeProxyInfo"] as? [String: Any],
-           let tok = proxy["token"] as? String,
-           let url = proxy["url"] as? String {
-            if !ep.isEmpty {
-                _ = try? await colabTunnelRequest(
-                    path: "/tun/m/\(ep)/keep-alive/",
-                    method: "GET",
-                    extraHeaders: ["X-Colab-Tunnel": "Google"],
-                    timeout: 12
-                )
-            }
-            let prev = loadSessionRecord()
-            let updated = RuntimeSessionRecord(
-                name: "easycolab",
-                token: tok,
-                url: url,
-                endpoint: ep,
-                accelerator: acc,
-                kernelId: prev?.kernelId,
-                sessionId: prev?.sessionId
+        if let updated = try? await ownedSession() {
+            _ = try? await colabTunnelRequest(
+                path: "/tun/m/\(updated.endpoint)/keep-alive/",
+                method: "GET",
+                extraHeaders: ["X-Colab-Tunnel": "Google"],
+                timeout: 12
             )
-            saveSessionRecord(updated)
             _ = try? await executeCodeOnKernel(
                 session: updated,
                 code: "import pathlib; pathlib.Path('/tmp/.easycolab_client_hb').touch(); _easycolab_hb = 1",

@@ -39,7 +39,7 @@ struct IOSOnboardingSheet: View {
                         icon: "moon.zzz.fill",
                         tint: .purple,
                         title: L("4. 双重省额度安全护栏", "4. Dual CU Billing Protection"),
-                        desc: L("云端内置 30 分钟闲置自动销毁看门狗，即使手机没电关机也绝不空耗 CU；用完更可在「云算力」页一键彻底释放全部实例归零计费。", "Built-in 30-min cloud auto-shutdown watchdog ensures zero wasted CU even if your phone loses signal or battery.")
+                        desc: L("云端内置 30 分钟闲置自动销毁看门狗，即使手机没电关机也绝不空耗 CU；用完更可在「云算力」页释放此设备创建的实例。", "Built-in 30-min cloud auto-shutdown watchdog ensures zero wasted CU even if your phone loses signal or battery.")
                     )
                     .tag(3)
                 }

@@ -45,11 +45,11 @@ struct CloudGPUTabView: View {
                     .presentationDetents([.medium, .large])
             }
             .confirmationDialog(
-                L("确认断开并销毁账号下全部云端 Colab 实例？", "Terminate all active cloud Colab VMs on your account?"),
+                L("释放此设备创建的 EasyColab 实例？", "Release the EasyColab runtime created on this device?"),
                 isPresented: $vm.showDisconnectConfirm,
                 titleVisibility: .visible
             ) {
-                Button(L("彻底释放实例并停止计费 (0 CU/h)", "Terminate All VMs (0 CU/h)"), role: .destructive) {
+                Button(L("释放此实例", "Release Runtime"), role: .destructive) {
                     Task { await vm.disconnectRemoteColab() }
                 }
                 Button(L("取消", "Cancel"), role: .cancel) {}
@@ -286,6 +286,15 @@ struct CloudGPUTabView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
             }
+            HStack {
+                SecureField(L("管理密码", "Management password"), text: $vm.adminPassword)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button(L("复制密码", "Copy password")) {
+                    UIPasteboard.general.setItems([["public.utf8-plain-text": vm.adminPassword]],
+                                                  options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)])
+                }.disabled(vm.adminPassword.isEmpty)
+            }
+
         }
         .padding(14)
         .background(Color(UIColor.secondarySystemGroupedBackground))
@@ -380,7 +389,7 @@ struct CloudGPUTabView: View {
             Button(role: .destructive) {
                 vm.showDisconnectConfirm = true
             } label: {
-                Label(L("断开连接并彻底释放全部实例 (0 CU/h)", "Disconnect & Terminate All Cloud VMs"), systemImage: "xmark.octagon.fill")
+                Label(L("断开并释放此设备的实例", "Disconnect & Release This Runtime"), systemImage: "xmark.octagon.fill")
                     .font(.subheadline.weight(.bold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)

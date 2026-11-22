@@ -22,7 +22,7 @@ rm -rf "${BUILD_ROOT}"
 mkdir -p "${APP_BUNDLE}"
 
 # 1. Bundle cloud engine & notebook resources into EasyColab.app
-for res_file in "VERSION" "app.py" "EasyColab_Server.ipynb"; do
+for res_file in "VERSION" "app.py" "runtime_auth.py" "mobile_bootstrap.py" "EasyColab_Server.ipynb"; do
     if [ -f "${PROJECT_ROOT}/${res_file}" ]; then
         cp -f "${PROJECT_ROOT}/${res_file}" "${APP_BUNDLE}/${res_file}"
     fi

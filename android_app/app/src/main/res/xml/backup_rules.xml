@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude domain="file" path="easycolab_secure/" />
+    <exclude domain="sharedpref" path="studio_secrets.xml" />
+    <exclude domain="sharedpref" path="easycolab_prefs.xml" />
+</full-backup-content>

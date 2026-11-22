@@ -22,10 +22,37 @@ final class IOSStudioViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(maskServerURL, forKey: "maskServerURL") }
     }
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
-        didSet { UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL") }
+        didSet {
+            UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL")
+            if StudioCredentials.origin(URL(string: oldValue)) != StudioCredentials.origin(URL(string: colabServerURL)) {
+                adminPassword = Self.password(for: colabServerURL)
+            }
+        }
     }
-    @Published var hfToken: String = UserDefaults.standard.string(forKey: "hfToken") ?? "" {
-        didSet { UserDefaults.standard.set(hfToken, forKey: "hfToken") }
+    static func password(for address: String) -> String {
+        guard let origin = StudioCredentials.origin(URL(string: address)) else { return "" }
+        return StudioCredentials.read("admin:" + origin)
+    }
+
+    @Published var adminPassword = IOSStudioViewModel.password(for: UserDefaults.standard.string(forKey: "colabServerURL") ?? "") {
+        didSet {
+            if let origin = StudioCredentials.origin(URL(string: colabServerURL)) {
+                StudioCredentials.write(adminPassword, for: "admin:" + origin)
+            }
+        }
+    }
+    let studioSession = URLSession(configuration: .ephemeral, delegate: StudioRequestRedirect(), delegateQueue: nil)
+    func adminRequest(_ request: URLRequest) throws -> URLRequest {
+        guard !adminPassword.isEmpty, let expected = StudioCredentials.origin(URL(string: normalizedBaseURL)),
+              expected == StudioCredentials.origin(request.url) else { throw URLError(.userAuthenticationRequired) }
+        var authenticated = request
+        let auth = Data(("easycolab:" + adminPassword).utf8).base64EncodedString()
+        authenticated.setValue("Basic " + auth, forHTTPHeaderField: "Authorization")
+        return authenticated
+    }
+
+    @Published var hfToken: String = StudioCredentials.migrate("hfToken") {
+        didSet { StudioCredentials.write(hfToken, for: "hfToken") }
     }
     @Published var autoSaveToPhotos: Bool = {
         if UserDefaults.standard.object(forKey: "autoSaveToPhotos") == nil { return true }
@@ -216,12 +243,13 @@ final class IOSStudioViewModel: ObservableObject {
         }
     }
     @Published var apiAccessKey: String = {
-        if let saved = UserDefaults.standard.string(forKey: "apiAccessKey"), !saved.isEmpty { return saved }
+        let saved = StudioCredentials.migrate("apiAccessKey")
+        if !saved.isEmpty { return saved }
         let gen = "sk-colab-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20).lowercased()
-        UserDefaults.standard.set(gen, forKey: "apiAccessKey")
+        StudioCredentials.write(gen, for: "apiAccessKey")
         return gen
     }() {
-        didSet { UserDefaults.standard.set(apiAccessKey, forKey: "apiAccessKey") }
+        didSet { StudioCredentials.write(apiAccessKey, for: "apiAccessKey") }
     }
     @Published var apiRequestCount: Int = 0
 
@@ -639,7 +667,9 @@ final class IOSStudioViewModel: ObservableObject {
             showAIConsentAlert = true
             return
         }
-        guard let appPyData = bundledServerEngineData() else {
+        guard let appPyData = bundledServerEngineData(),
+              let authURL = bundledResourceURL("runtime_auth.py"), let auth = try? Data(contentsOf: authURL),
+              let bootstrapURL = bundledResourceURL("mobile_bootstrap.py"), let bootstrap = try? Data(contentsOf: bootstrapURL) else {
             statusMessage = L("未找到内置云端服务组件资源文件。", "Missing bundled cloud server engine resource.")
             return
         }
@@ -656,7 +686,8 @@ final class IOSStudioViewModel: ObservableObject {
         statusMessage = liveConsoleLines[0]
 
         do {
-            let tunnelURL = try await ColabNativeBridge.shared.wakeAndDeploy(gpuType: gpu, appPyData: appPyData) { [weak self] line in
+            let password = UUID().uuidString + UUID().uuidString
+            let tunnelURL = try await ColabNativeBridge.shared.wakeAndDeploy(gpuType: gpu, appPyData: appPyData, runtimeAuth: auth, bootstrap: bootstrap, password: password) { [weak self] line in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let clean = stripEmoji(line)
@@ -666,6 +697,7 @@ final class IOSStudioViewModel: ObservableObject {
                 }
             }
             colabServerURL = tunnelURL
+            adminPassword = password
             liveConsoleLines.append(L("成功建立加密隧道: \(maskedURLDisplay(tunnelURL))", "Public tunnel active: \(maskedURLDisplay(tunnelURL))"))
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             showToast(L("\(gpu) 实例已唤醒就绪！", "\(gpu) Runtime Ready!"))
@@ -681,21 +713,25 @@ final class IOSStudioViewModel: ObservableObject {
     }
 
     func disconnectRemoteColab() async {
-        statusMessage = L("正在释放全部云端 Colab 实例并归零计费...", "Terminating all cloud Colab VMs & stopping billing...")
+        statusMessage = L("正在释放此设备的实例...", "Releasing this device’s runtime...")
         let base = normalizedBaseURL
         if !base.isEmpty, let url = URL(string: "\(base)/minimax_api/disconnect") {
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.timeoutInterval = 8
-            _ = try? await URLSession.shared.data(for: req)
+            _ = try? await studioSession.data(for: adminRequest(req))
         }
         if cliLoggedIn {
             let res = await ColabNativeBridge.shared.stopAll()
+            guard res.ok else {
+                statusMessage = res.error ?? L("释放实例失败，请在 Colab 检查。", "Release failed. Check the runtime in Colab.")
+                return
+            }
             officialCUBalance = res.paidBalance ?? officialCUBalance
-            officialBurnRate = res.burnRateHourly ?? 0.0
+            officialBurnRate = res.burnRateHourly ?? officialBurnRate
             activeVMCount = res.activeAssignments
-            statusMessage = res.message ?? L("已彻底释放全部云端实例，计费归零。", "All cloud instances terminated (0 CU/h).")
-            showToast(L("已释放实例 · 0.00 CU/h", "Instances Terminated · 0 CU/h"))
+            statusMessage = res.message ?? L("已释放此设备的实例。", "Released this device’s runtime.")
+            showToast(L("已完成实例释放请求", "Runtime release completed"))
         } else {
             statusMessage = L("已向服务端发送释放关机指令。", "Sent shutdown command to cloud runtime.")
         }
@@ -805,7 +841,7 @@ final class IOSStudioViewModel: ObservableObject {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: ["model_id": modelId])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             applyStatusResponse(decoded)
         } catch {}
@@ -947,7 +983,7 @@ final class IOSStudioViewModel: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 12
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             applyStatusResponse(dec)
         }
@@ -1056,7 +1092,7 @@ final class IOSStudioViewModel: ObservableObject {
             }
 
             req.httpBody = try JSONSerialization.data(withJSONObject: payload)
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             guard activeGenerationToken == myToken else { return }
             let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
 
@@ -1098,7 +1134,7 @@ final class IOSStudioViewModel: ObservableObject {
             do {
                 var req = URLRequest(url: pollURL)
                 req.timeoutInterval = 30
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await studioSession.data(for: adminRequest(req))
                 guard isGenerating && activeGenerationToken == token else { break }
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if code == 404 {

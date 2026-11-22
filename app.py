@@ -1,7 +1,10 @@
 import os
 
 # Remove the deployment secret before any model installer starts subprocesses.
-_DEPLOY_PASSWORD = os.environ.pop("EASYCOLAB_ADMIN_PASSWORD", "") if __name__ == "__main__" else ""
+from runtime_auth import authenticated_ingress, deployment_password, COMFY_BACKEND, COMFY_INGRESS, GRADIO_BACKEND, GRADIO_INGRESS
+
+if __name__ == "__main__":
+    _DEPLOY_PASSWORD = deployment_password()
 import io
 import gc
 import re
@@ -13,20 +16,9 @@ import queue
 import atexit
 import socket
 import base64
-import contextlib
 import secrets
 import signal
-try:
-    from runtime_auth import authenticated_ingress, COMFY_BACKEND, COMFY_INGRESS, GRADIO_BACKEND, GRADIO_INGRESS
-except ImportError:
-    authenticated_ingress = None
-    GRADIO_INGRESS = 7860
-    GRADIO_BACKEND = 27860
-    COMFY_INGRESS = 8188
-    COMFY_BACKEND = 28188
-if __name__ == "__main__" and not _DEPLOY_PASSWORD and (authenticated_ingress is None or not sys.stdin.isatty()):
-    GRADIO_BACKEND = GRADIO_INGRESS
-    COMFY_BACKEND = COMFY_INGRESS
+from pathlib import Path
 import subprocess
 import threading
 from collections import deque
@@ -1283,42 +1275,6 @@ def _is_drive_mounted_live() -> bool:
 
 
 DRIVE_MOUNTED = _is_drive_mounted_live()
-_RCLONE_DRIVE_PROBE_CACHE: Dict[str, Any] = {"mtime": -1.0, "ts": 0.0, "ok": False}
-
-
-def _has_rclone_drive_remote() -> bool:
-    rc_path = os.path.expanduser("~/.config/rclone/rclone.conf")
-    if not os.path.exists(rc_path) or not shutil.which("rclone"):
-        return False
-    try:
-        st_mtime = os.path.getmtime(rc_path)
-        with open(rc_path, "r", encoding="utf-8", errors="ignore") as f:
-            txt = f.read()
-        if "[easycolab_gdrive]" not in txt:
-            return False
-        # 公共 ADC Client (764086051850-*) 无 quota_project 时会被 Google Drive API 403 拒绝，不可视为有效云盘远程
-        if "client_id = 764086051850-" in txt:
-            return False
-        now = time.time()
-        if (
-            _RCLONE_DRIVE_PROBE_CACHE["mtime"] == st_mtime
-            and (_RCLONE_DRIVE_PROBE_CACHE["ok"] or (now - _RCLONE_DRIVE_PROBE_CACHE["ts"]) < 120.0)
-        ):
-            return bool(_RCLONE_DRIVE_PROBE_CACHE["ok"])
-        probe = subprocess.run(
-            ["rclone", "about", "easycolab_gdrive:", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-        ok = probe.returncode == 0
-        _RCLONE_DRIVE_PROBE_CACHE["mtime"] = st_mtime
-        _RCLONE_DRIVE_PROBE_CACHE["ts"] = now
-        _RCLONE_DRIVE_PROBE_CACHE["ok"] = ok
-        return ok
-    except Exception:
-        return False
 
 
 COMFYUI_LOCK = threading.Lock()
@@ -1334,9 +1290,9 @@ COMFYUI_STATE: Dict[str, Any] = {
     "local_port": COMFY_BACKEND,
     "queue_running": 0,
     "queue_pending": 0,
-    "persistence_mode": "drive_symlink" if DRIVE_MOUNTED else ("rclone_drive_sync" if _has_rclone_drive_remote() else "local_only"),
-    "persistence_label": "Google Drive 实时软链挂载" if DRIVE_MOUNTED else ("Google Drive 云盘自动持久化" if _has_rclone_drive_remote() else "实例本地高速存储"),
-    "drive_persisted": bool(DRIVE_MOUNTED or _has_rclone_drive_remote()),
+    "persistence_mode": "drive_symlink" if DRIVE_MOUNTED else "local_only",
+    "persistence_label": "Google Drive 实时软链挂载" if DRIVE_MOUNTED else "实例本地高速存储",
+    "drive_persisted": DRIVE_MOUNTED,
     "custom_nodes_count": 0,
     "models_count": 0,
     "workflows_count": 0,
@@ -1801,6 +1757,34 @@ def _analyze_hf_model_sizing(
     }
 
 
+_HF_ORIGIN = "https://huggingface.co"
+
+
+def _hf_metadata_hosts(token):
+    return (_HF_ORIGIN,) if token else (_HF_ORIGIN, "https://hf-mirror.com")
+
+
+def _is_hf_origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme == "https" and parsed.netloc.lower() in ("huggingface.co", "huggingface.co:443")
+
+
+class _HFRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        authorization = req.get_header("Authorization")
+        if redirected is not None and authorization and _is_hf_origin(req.full_url) and _is_hf_origin(redirected.full_url):
+            redirected.add_unredirected_header("Authorization", authorization)
+        return redirected
+
+
+def _open_hf_url(url, token, *, timeout, headers=None):
+    request = urllib.request.Request(url, headers={"User-Agent": "EasyColab/2.0", **(headers or {})})
+    if token and _is_hf_origin(url):
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
+    return urllib.request.build_opener(_HFRedirectHandler()).open(request, timeout=timeout)
+
+
 def fetch_hf_trending_models_core(
     category: str = "all",
     limit: int = 12,
@@ -1817,16 +1801,12 @@ def fetch_hf_trending_models_core(
     lim = max(4, min(24, int(limit or 12)))
     cache_key = f"{cat_key}:{lim}:{sq.lower()}"
     now = time.time()
-    if not force_refresh:
+    token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
+    if not token and not force_refresh:
         with _HF_TRENDING_LOCK:
             cached = _HF_TRENDING_CACHE.get(cache_key)
             if cached and (now - cached[0]) < 180.0 and cached[1]:
                 return list(cached[1])
-
-    token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
-    headers = {"User-Agent": "EasyColab/2.0", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
 
     expand_qs = (
         "&expand[]=safetensors&expand[]=gguf&expand[]=likes"
@@ -1854,10 +1834,9 @@ def fetch_hf_trending_models_core(
 
     for qpath in query_paths:
         fetched = None
-        for host in ("https://huggingface.co", "https://hf-mirror.com"):
+        for host in _hf_metadata_hosts(token):
             try:
-                req = urllib.request.Request(f"{host}{qpath}", headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with _open_hf_url(f"{host}{qpath}", token, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     if isinstance(data, list):
                         fetched = data
@@ -1921,7 +1900,7 @@ def fetch_hf_trending_models_core(
         if len(results) >= lim:
             break
 
-    if results:
+    if results and not token:
         with _HF_TRENDING_LOCK:
             _HF_TRENDING_CACHE[cache_key] = (now, list(results))
     return results
@@ -1932,21 +1911,16 @@ def fetch_hf_model_detail_core(repo_id: str, hf_token: str = "") -> Dict[str, An
     获取单个 HuggingFace 模型仓库的完整详情：
     参数量、架构、上下文长度、开源协议、基座模型、各权重/量化分片精确体积与单文件 Colab 卡型适配评估，以及 README 摘要。
     """
-    clean_id = _normalize_hf_repo_id(repo_id)
+    clean_id, _ = _normalize_hf_repo_and_pattern(repo_id)
     if not clean_id or "/" not in clean_id:
         return {"ok": False, "error": "Invalid HuggingFace Repo ID"}
 
     token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
-    headers = {"User-Agent": "EasyColab/2.0", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
     meta: Optional[Dict[str, Any]] = None
-    for host in ("https://huggingface.co", "https://hf-mirror.com"):
+    for host in _hf_metadata_hosts(token):
         try:
             url = f"{host}/api/models/{clean_id}?blobs=true"
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with _open_hf_url(url, token, timeout=12) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if isinstance(data, dict) and (data.get("id") or data.get("modelId")):
                     meta = data
@@ -2043,13 +2017,10 @@ def fetch_hf_model_detail_core(repo_id: str, hf_token: str = "") -> Dict[str, An
     sizing = _analyze_hf_model_sizing(meta, is_gguf, fallback_storage_gb=fallback_gb)
 
     readme_excerpt = ""
-    for host in ("https://huggingface.co", "https://hf-mirror.com"):
+    for host in _hf_metadata_hosts(token):
         try:
             r_url = f"{host}/{rid}/raw/main/README.md"
-            r_req = urllib.request.Request(r_url, headers={"User-Agent": "EasyColab/2.0"})
-            if token:
-                r_req.add_header("Authorization", f"Bearer {token}")
-            with urllib.request.urlopen(r_req, timeout=6) as r_resp:
+            with _open_hf_url(r_url, token, timeout=6) as r_resp:
                 raw_md = r_resp.read(32768).decode("utf-8", errors="ignore")
                 readme_excerpt = _clean_hf_readme_excerpt(raw_md)
                 if readme_excerpt:
@@ -2150,20 +2121,13 @@ def inspect_and_resolve_hf_repo(
             }
 
     token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
-    if token:
-        os.environ["HF_TOKEN"] = token
-    headers = {"User-Agent": "EasyColab/2.0", "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
     meta = None
     last_http_code = 0
     last_err = None
-    for host in ("https://huggingface.co", "https://hf-mirror.com"):
+    for host in _hf_metadata_hosts(token):
         api_url = f"{host}/api/models/{repo_clean}?blobs=true"
-        req = urllib.request.Request(api_url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _open_hf_url(api_url, token, timeout=20) as resp:
                 meta = json.loads(resp.read().decode("utf-8"))
                 break
         except urllib.error.HTTPError as he:
@@ -2407,8 +2371,6 @@ def register_custom_hf_model_core(
     touch_activity()
     try:
         effective_modality = (modality_hint or modality or "auto").strip()
-        if hf_token and hf_token.strip():
-            os.environ["HF_TOKEN"] = hf_token.strip()
         resolved = inspect_and_resolve_hf_repo(
             repo_id=repo_id,
             include_pattern=include_pattern,
@@ -2564,7 +2526,7 @@ def _flush_drive_file(file_path: str) -> None:
 
 
 def _persist_generated_output_to_drive(output_path: str) -> str:
-    """确保生成的视频或图片真正持久化到 Google Drive（原生挂载实时刷盘或自定义 rclone 远端同步）"""
+    """确保生成的视频或图片真正持久化到 Google Drive（已原生挂载时实时刷盘）"""
     if not output_path or not os.path.exists(output_path):
         return output_path
     mounted = _refresh_drive_mount_state()
@@ -2578,44 +2540,12 @@ def _persist_generated_output_to_drive(output_path: str) -> str:
             return dst_path
         _flush_drive_file(output_path)
         return output_path
-    if _has_rclone_drive_remote():
-        try:
-            cp_res = subprocess.run(
-                [
-                    "rclone", "copy",
-                    output_path,
-                    "easycolab_gdrive:EasyColab_Drive/EasyColab_Outputs",
-                    "--drive-chunk-size", "64M",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
-            )
-            if cp_res.returncode == 0:
-                print(f"[Google Drive 同步完成] {os.path.basename(output_path)} -> EasyColab_Drive/EasyColab_Outputs")
-            else:
-                err_tail = (cp_res.stderr or cp_res.stdout or "").strip()[-200:]
-                print(f"[Google Drive 同步失败] {os.path.basename(output_path)}: {err_tail}")
-        except Exception as sync_err:
-            print(f"[Google Drive 同步异常] {os.path.basename(output_path)}: {sync_err}")
     return output_path
 
 
 # ==============================================================================
 # 借鉴 comfy-colab-kit 的 8 线程 HTTP Range 并行极速下载器 (400~700 MB/s)
 # ==============================================================================
-class _StripAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """重定向到 HuggingFace CDN (CloudFront/Xet) 时剥离 Authorization 头，防止 400/403 拒绝"""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_req is not None and "Authorization" in new_req.unredirected_hdrs:
-            del new_req.unredirected_hdrs["Authorization"]
-        if new_req is not None and "Authorization" in new_req.headers:
-            del new_req.headers["Authorization"]
-        return new_req
-
-
 def fast_parallel_hf_download(
     repo_id: str,
     filename: str,
@@ -2627,22 +2557,19 @@ def fast_parallel_hf_download(
     使用 8 路并发 HTTP Range 连接直接从 HuggingFace CDN 下载大权重文件至内存盘/本地盘，
     规避单连接 ~60MB/s 限速，在 Colab 上可达 400~700 MB/s。
     """
+    if any(part in ("", ".", "..") for part in filename.split("/")) or "\\" in filename:
+        raise ValueError("Invalid relative model filename")
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, filename)
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     temp_path = dest_path + ".part"
 
     url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-    opener = urllib.request.build_opener(_StripAuthRedirectHandler())
-    headers = {"User-Agent": "EasyColab/2.0"}
     token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
 
     try:
         # Probe final CDN URL & Content-Length via Range: bytes=0-0
-        probe_req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
-        with opener.open(probe_req, timeout=20) as resp:
+        with _open_hf_url(url, token, timeout=20, headers={"Range": "bytes=0-0"}) as resp:
             cdn_url = resp.geturl()
             content_range = resp.headers.get("Content-Range", "")
             if "/" in content_range:
@@ -2653,7 +2580,7 @@ def fast_parallel_hf_download(
         # 若文件较小 (<32MB) 或未返回支持分片的大小，直接走 hf_hub_download
         if total_size < 32 * 1024 * 1024:
             from huggingface_hub import hf_hub_download
-            return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token or None)
+            return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token or False, endpoint=_HF_ORIGIN)
 
         with open(temp_path, "wb") as f:
             f.truncate(total_size)
@@ -2673,11 +2600,7 @@ def fast_parallel_hf_download(
         def _download_chunk(byte_range: Tuple[int, int]):
             nonlocal downloaded_bytes
             start_b, end_b = byte_range
-            chunk_req = urllib.request.Request(
-                cdn_url,
-                headers={"User-Agent": "EasyColab/2.0", "Range": f"bytes={start_b}-{end_b}"},
-            )
-            with urllib.request.urlopen(chunk_req, timeout=60) as r, open(temp_path, "r+b") as wf:
+            with _open_hf_url(cdn_url, token, timeout=60, headers={"Range": f"bytes={start_b}-{end_b}"}) as r, open(temp_path, "r+b") as wf:
                 wf.seek(start_b)
                 while True:
                     buf = r.read(4 * 1024 * 1024)  # 4MB buffer
@@ -2726,7 +2649,7 @@ def fast_parallel_hf_download(
             except Exception:
                 pass
         from huggingface_hub import hf_hub_download
-        return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token or None)
+        return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token or False, endpoint=_HF_ORIGIN)
 
 
 
@@ -3476,8 +3399,6 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
     ):
         base[k] = hw.get(k, 0.0)
     base.update(file_status)
-    if _has_rclone_drive_remote():
-        base["drive_persisted"] = True
     base["comfyui"] = get_comfyui_status_dict()
     return base
 
@@ -3587,11 +3508,6 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
         ACTIVE_TQDM_BARS.clear()
 
     try:
-        if hf_token and hf_token.strip():
-            os.environ["HF_TOKEN"] = hf_token.strip()
-            from huggingface_hub import login
-            login(token=hf_token.strip(), add_to_git_credential=False)
-
         ram_dir, nvme_dir, drive_dir = _get_model_dirs(target_id)
         already_ready_gb = 0.0
         for fn_chk, _ in req_files:
@@ -3677,7 +3593,8 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
                     repo_id=repo_id,
                     local_dir=primary_dl_dir,
                     ignore_patterns=["*.safetensors", "*.bin", "*.pth", "*.gguf", "*.pt"],
-                    token=(hf_token or os.environ.get("HF_TOKEN") or "").strip() or None,
+                    token=(hf_token or os.environ.get("HF_TOKEN") or "").strip() or False,
+                    endpoint=_HF_ORIGIN,
                 )
             elif pipeline_arch == "qwen_image_21":
                 from diffsynth.pipelines.qwen_image_21 import ModelConfig
@@ -3818,12 +3735,13 @@ def prepare_minimax_h3_image_assembled_dir(
         if not _configs_complete(assembled_dir):
             from huggingface_hub import snapshot_download
 
-            tok = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or None
+            tok = (hf_token or os.environ.get("HF_TOKEN") or "").strip() or False
             snapshot_download(
                 repo_id=repo_id or "MiniMaxAI/MiniMax-H3-Image",
                 local_dir=assembled_dir,
                 allow_patterns=MINIMAX_H3_IMAGE_CONFIG_PATTERNS,
                 token=tok,
+                endpoint=_HF_ORIGIN,
             )
             if DRIVE_MOUNTED and os.path.exists("/content/drive/MyDrive"):
                 try:
@@ -5071,14 +4989,18 @@ def load_model_to_vram_core(
                     for _ in range(sub_depth):
                         model_dir = os.path.dirname(model_dir)
                 from diffusers import AutoPipelineForText2Image, DiffusionPipeline
+                source = model_dir if os.path.isfile(os.path.join(model_dir, "model_index.json")) else repo_id
+                token = (hf_token or os.environ.get("HF_TOKEN") or "").strip() if source == repo_id else ""
+                if token and os.environ.get("HF_ENDPOINT", _HF_ORIGIN).rstrip("/") != _HF_ORIGIN:
+                    raise ValueError("Authenticated Diffusers downloads require the official Hugging Face endpoint")
                 try:
                     new_pipe = AutoPipelineForText2Image.from_pretrained(
-                        model_dir if os.path.exists(os.path.join(model_dir, "model_index.json")) else repo_id,
+                        source, token=token or False,
                         torch_dtype=torch.bfloat16,
                     ).to("cuda")
                 except Exception:
                     new_pipe = DiffusionPipeline.from_pretrained(
-                        model_dir if os.path.exists(os.path.join(model_dir, "model_index.json")) else repo_id,
+                        source, token=token or False,
                         torch_dtype=torch.bfloat16,
                     ).to("cuda")
                 mode_label = f"{spec['name']} · Diffusers BF16"
@@ -5105,6 +5027,8 @@ def load_model_to_vram_core(
                     snapshot_download(
                         repo_id=repo_id,
                         local_dir=model_dir,
+                        token=(hf_token or os.environ.get("HF_TOKEN") or "").strip() or False,
+                        endpoint=_HF_ORIGIN,
                         ignore_patterns=["*.safetensors", "*.bin", "*.pth", "*.gguf", "*.pt"],
                     )
 
@@ -5216,7 +5140,7 @@ def load_model_to_vram_core(
                                 repo_id="unsloth/Qwen3.8-27B-GGUF",
                                 filename=mtp_rel,
                                 dest_dir=dl_dir,
-                                hf_token=os.environ.get("HF_TOKEN", ""),
+                                hf_token=hf_token,
                                 num_connections=8,
                             )
                             if DRIVE_MOUNTED and dl_dir != drive_d:
@@ -6510,9 +6434,6 @@ def _resolve_comfyui_persistence_paths() -> Tuple[str, str, str, str, bool]:
     if _refresh_drive_mount_state():
         persist_root = "/content/drive/MyDrive/EasyColab_ComfyUI"
         return comfy_root, persist_root, "drive_symlink", "Google Drive 实时软链直连", True
-    if _has_rclone_drive_remote():
-        persist_root = "/content/drive_mirror/EasyColab_ComfyUI"
-        return comfy_root, persist_root, "rclone_drive_sync", "Google Drive 自动软链持久化", True
     persist_root = (
         "/content/EasyColab_ComfyUI_Data"
         if os.path.exists("/content")
@@ -6817,7 +6738,7 @@ def free_comfyui_vram_core() -> Tuple[bool, str]:
 def sync_comfyui_to_drive_core(quiet: bool = False) -> Tuple[bool, str]:
     if COMFYUI_STATE["is_syncing_drive"]:
         return True, "正在后台同步 ComfyUI 数据到 Google Drive..."
-    comfy_root, persist_root, mode, label, is_drive = _resolve_comfyui_persistence_paths()
+    comfy_root, persist_root, _, label, _ = _resolve_comfyui_persistence_paths()
     if not os.path.isdir(comfy_root) and not os.path.isdir(persist_root):
         return False, "ComfyUI 尚未初始化"
 
@@ -6884,25 +6805,6 @@ def sync_comfyui_to_drive_core(quiet: bool = False) -> Tuple[bool, str]:
             with open(manifest_path, "w", encoding="utf-8") as mf:
                 json.dump(manifest, mf, ensure_ascii=False, indent=2)
 
-        # 3. 若处于 rclone 云盘镜像模式，通过 Google Cloud 内网 8 并发同步至 Google Drive
-        if mode == "rclone_drive_sync" and _has_rclone_drive_remote():
-            if not quiet:
-                print("[ComfyUI 云盘同步] 正在通过高速通道将自定义节点、模型与工作流同步至 Google Drive...")
-            subprocess.run(
-                [
-                    "rclone", "copy",
-                    persist_root,
-                    "easycolab_gdrive:EasyColab_Drive/EasyColab_ComfyUI",
-                    "--transfers", "8",
-                    "--checkers", "16",
-                    "--drive-chunk-size", "64M",
-                    "--exclude", "**/__pycache__/**",
-                    "--exclude", "**/*.part",
-                    "--exclude", "**/*.tmp",
-                ],
-                check=False,
-            )
-
         COMFYUI_STATE["last_sync_ts"] = time.time()
         _COMFY_STATUS_CACHE["ts"] = 0.0
         (cn_count, m_count, wf_count), _ = _scan_comfyui_counts_and_outputs()
@@ -6928,28 +6830,19 @@ def _comfyui_periodic_drive_sync_loop():
                 sync_comfyui_to_drive_core(quiet=True)
 
 
-def _ensure_comfyui_manager_tunnel_config(comfy_root: str, persist_root: str):
-    """允许通过 trycloudflare 公网隧道在 ComfyUI-Manager 内直接安装 Git 节点与模型，不受默认 normal 安全锁拦截"""
-    cfg_targets = [
-        os.path.join(persist_root, "user", "default", "ComfyUI-Manager", "config.ini"),
-        os.path.join(persist_root, "user", "__manager", "config.ini"),
-        os.path.join(comfy_root, "custom_nodes", "ComfyUI-Manager", "config.ini"),
-    ]
-    for cfg_p in cfg_targets:
-        try:
-            os.makedirs(os.path.dirname(cfg_p), exist_ok=True)
-            if os.path.exists(cfg_p):
-                txt = open(cfg_p, "r", encoding="utf-8", errors="ignore").read()
-                if "security_level" in txt:
-                    new_txt = re.sub(r"security_level\s*=\s*\S+", "security_level = weak", txt)
-                    if new_txt != txt:
-                        with open(cfg_p, "w", encoding="utf-8") as wf:
-                            wf.write(new_txt)
-                    continue
-            with open(cfg_p, "w", encoding="utf-8") as wf:
-                wf.write("[default]\nsecurity_level = weak\npreview_method = auto\n")
-        except Exception:
-            pass
+def _restore_comfyui_manager_security(comfy_root: str, persist_root: str):
+    """Migrate earlier EasyColab settings when starting the Manager again."""
+    configs = (
+        Path(persist_root, "user", "default", "ComfyUI-Manager", "config.ini"),
+        Path(persist_root, "user", "__manager", "config.ini"),
+        Path(comfy_root, "custom_nodes", "ComfyUI-Manager", "config.ini"),
+    )
+    for config in configs:
+        if config.is_file():
+            previous = config.read_text(encoding="utf-8")
+            updated = re.sub(r"(?im)^([ \t]*security_level[ \t]*=[ \t]*)weak\b", r"\g<1>normal", previous)
+            if updated != previous:
+                config.write_text(updated, encoding="utf-8")
 
 
 def _install_persisted_custom_node_requirements(comfy_root: str):
@@ -7063,28 +6956,7 @@ def start_comfyui_core(unload_existing: bool = False, force_restart: bool = Fals
             COMFYUI_STATE["status_message"] = "正在释放现有常驻模型显存，为 ComfyUI 腾出完整 96GB 空间..."
             unload_model_from_vram_core("all")
 
-        comfy_root, persist_root, mode, label, is_drive = _resolve_comfyui_persistence_paths()
-
-        # 1. 若为 rclone 云盘同步模式且本实例首次拉起，先从 Google Drive 高速拉取已持久化的节点、模型与工作流
-        pull_flag = "/tmp/.easycolab_comfy_drive_pulled"
-        if mode == "rclone_drive_sync" and _has_rclone_drive_remote() and not os.path.exists(pull_flag):
-            COMFYUI_STATE["progress"] = 0.14
-            COMFYUI_STATE["status_message"] = "正在从 Google Drive 恢复历史持久化的 ComfyUI 节点、模型与工作流..."
-            print("[ComfyUI] 正在从 Google Drive 同步已保存的节点、模型与工作流...")
-            os.makedirs(persist_root, exist_ok=True)
-            subprocess.run(
-                [
-                    "rclone", "copy",
-                    "easycolab_gdrive:EasyColab_Drive/EasyColab_ComfyUI",
-                    persist_root,
-                    "--transfers", "8",
-                    "--checkers", "16",
-                    "--drive-chunk-size", "64M",
-                ],
-                check=False,
-            )
-            with open(pull_flag, "w") as pf:
-                pf.write("1")
+        comfy_root, persist_root, _, label, _ = _resolve_comfyui_persistence_paths()
 
         # 2. 克隆或检查 ComfyUI 主程序 (置于本地高速 NVMe，保证秒级导入)
         if not os.path.exists(os.path.join(comfy_root, "main.py")):
@@ -7182,7 +7054,7 @@ def start_comfyui_core(unload_existing: bool = False, force_restart: bool = Fals
                 subprocess.run(["git", "clone", "--depth", "1", repo_url, target_node_dir], check=False)
 
         _ensure_easycolab_comfy_preset_helper(comfy_root, persist_root)
-        _ensure_comfyui_manager_tunnel_config(comfy_root, persist_root)
+        _restore_comfyui_manager_security(comfy_root, persist_root)
 
         COMFYUI_STATE["progress"] = 0.70
         COMFYUI_STATE["status_message"] = "正在检查并安装已保存自定义节点的 Python 依赖包..."
@@ -7324,7 +7196,9 @@ def download_comfyui_model_core(
         return False, "当前已有 ComfyUI 权重正在下载中，请稍候"
 
     clean_sub = re.sub(r"[^a-zA-Z0-9_.-]", "", (subfolder or "diffusion_models").strip()) or "diffusion_models"
-    comfy_root, persist_root, mode, label, _ = _resolve_comfyui_persistence_paths()
+    if clean_sub in (".", ".."):
+        return False, "Invalid model subfolder"
+    comfy_root, persist_root, _, label, _ = _resolve_comfyui_persistence_paths()
     dest_dir = os.path.join(persist_root, "models", clean_sub)
     os.makedirs(dest_dir, exist_ok=True)
     if os.path.isdir(comfy_root):
@@ -7350,13 +7224,9 @@ def download_comfyui_model_core(
             base_name = os.path.basename(filename.strip() or url_path) or f"model_{int(time.time())}.safetensors"
             final_path = os.path.join(dest_dir, base_name)
             COMFYUI_STATE["status_message"] = f"正在下载 {base_name} 至 models/{clean_sub}..."
-            print(f"[ComfyUI 直链下载] {raw_src} -> models/{clean_sub}/{base_name}")
-            headers = {"User-Agent": "EasyColab/2.0"}
-            if token and urllib.parse.urlsplit(raw_src).scheme == "https" and urllib.parse.urlsplit(raw_src).hostname == "huggingface.co":
-                headers["Authorization"] = f"Bearer {token}"
-            req = urllib.request.Request(raw_src, headers=headers)
+            print(f"[ComfyUI 直链下载] models/{clean_sub}/{base_name}")
             tmp_p = final_path + ".part"
-            with urllib.request.build_opener(_StripAuthRedirectHandler()).open(req, timeout=120) as resp, open(tmp_p, "wb") as wf:
+            with _open_hf_url(raw_src, token, timeout=120) as resp, open(tmp_p, "wb") as wf:
                 total_sz = int(resp.headers.get("Content-Length") or 0)
                 done_sz = 0
                 t0 = time.time()
@@ -7386,8 +7256,6 @@ def download_comfyui_model_core(
             if os.path.abspath(dl_path) != os.path.abspath(final_path):
                 shutil.move(dl_path, final_path)
 
-        if mode == "rclone_drive_sync":
-            sync_comfyui_to_drive_core(quiet=True)
         _COMFY_STATUS_CACHE["ts"] = 0.0
         sz_gb = os.path.getsize(final_path) / (1024 ** 3)
         msg = f"权重 {base_name} ({sz_gb:.2f} GB) 已下载至 models/{clean_sub} 并持久化到 {label}（在画布按 R 键即可刷新选用）"
@@ -7418,7 +7286,7 @@ def install_comfyui_preset_pack_core(
     if COMFYUI_STATE["is_downloading_weight"] or COMFYUI_STATE.get("installing_pack_id"):
         return False, "当前已有模型或工作流包正在高速下载配齐中，请稍候..."
 
-    comfy_root, persist_root, mode, label, _ = _resolve_comfyui_persistence_paths()
+    comfy_root, persist_root, _, label, _ = _resolve_comfyui_persistence_paths()
     models_list = target_pack["models"]
     total_m = len(models_list)
 
@@ -7429,25 +7297,6 @@ def install_comfyui_preset_pack_core(
 
     try:
         token = (hf_token or "").strip() or ""
-        # 若为 rclone 模式且尚未拉取过云盘历史权重，先快速检查恢复，避免重复下载已持久化的权重
-        pull_flag = "/tmp/.easycolab_comfy_drive_pulled"
-        if mode == "rclone_drive_sync" and _has_rclone_drive_remote() and not os.path.exists(pull_flag):
-            COMFYUI_STATE["status_message"] = "正在先从 Google Drive 检查已持久化的历史模型权重..."
-            os.makedirs(persist_root, exist_ok=True)
-            subprocess.run(
-                [
-                    "rclone", "copy",
-                    "easycolab_gdrive:EasyColab_Drive/EasyColab_ComfyUI",
-                    persist_root,
-                    "--transfers", "8",
-                    "--checkers", "16",
-                    "--drive-chunk-size", "64M",
-                ],
-                check=False,
-            )
-            with open(pull_flag, "w") as pf:
-                pf.write("1")
-
         _ensure_comfyui_beginner_assets(comfy_root, persist_root)
 
         for idx, (sub, fname, repo_id, repo_rel_path, approx_gb) in enumerate(models_list, start=1):
@@ -7494,11 +7343,6 @@ def install_comfyui_preset_pack_core(
             _safe_symlink_dir(os.path.join(persist_root, "user"), os.path.join(comfy_root, "user"))
             _safe_symlink_dir(os.path.join(persist_root, "output"), os.path.join(comfy_root, "output"))
             _ensure_comfyui_beginner_assets(comfy_root, persist_root)
-
-        if mode == "rclone_drive_sync":
-            COMFYUI_STATE["progress"] = 0.93
-            COMFYUI_STATE["status_message"] = "正在将配齐的模型与中文工作流持久化同步至 Google Drive..."
-            sync_comfyui_to_drive_core(quiet=True)
 
         _COMFY_STATUS_CACHE["ts"] = 0.0
         wf_names_str = "、".join(installed_wfs) if installed_wfs else "、".join(target_pack["workflows"])
@@ -9261,24 +9105,24 @@ def attach_macos_api_routes(app: FastAPI):
 
     @app.get("/minimax_api/hf_trending")
     def api_hf_trending(
+        request: Request,
         category: str = "all",
         limit: int = 12,
-        hf_token: str = "",
         force_refresh: bool = False,
         search_query: str = "",
     ):
         items = fetch_hf_trending_models_core(
             category=category,
             limit=limit,
-            hf_token=hf_token,
+            hf_token=request.headers.get("X-HuggingFace-Token", ""),
             force_refresh=force_refresh,
             search_query=search_query,
         )
         return {"ok": True, "category": category, "search_query": search_query, "models": items}
 
     @app.get("/minimax_api/hf_model_detail")
-    def api_hf_model_detail(repo_id: str = "", hf_token: str = ""):
-        return fetch_hf_model_detail_core(repo_id=repo_id, hf_token=hf_token)
+    def api_hf_model_detail(request: Request, repo_id: str = ""):
+        return fetch_hf_model_detail_core(repo_id=repo_id, hf_token=request.headers.get("X-HuggingFace-Token", ""))
 
     @app.post("/minimax_api/custom_model/register")
     def api_register_custom_model(req: RegisterCustomModelRequest):
@@ -10768,21 +10612,14 @@ def create_ui() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    import getpass
     from gradio import networking
-
-    if authenticated_ingress is not None and (_DEPLOY_PASSWORD or sys.stdin.isatty()):
-        password = _DEPLOY_PASSWORD or getpass.getpass("Management password (24+ URL-safe characters): ")
-        ingress_ctx = authenticated_ingress(password)
-    else:
-        ingress_ctx = contextlib.nullcontext()
 
     # Unwind the ingress context on a headless hot redeploy (pkill sends TERM).
     def stop_server(signum, frame):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_server)
-    with ingress_ctx:
+    with authenticated_ingress(_DEPLOY_PASSWORD):
         ui = create_ui()
         ui.queue()
         app, _, _ = ui.launch(

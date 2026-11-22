@@ -571,7 +571,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         card.body.addWidget(self.idle_countdown_lbl)
 
         # Destructive Release All VMs Button
-        self.release_all_btn = set_btn_role(QPushButton(tr("释放全部实例", "Release All Runtimes")), "danger")
+        self.release_all_btn = set_btn_role(QPushButton(tr("释放 EasyColab 实例", "Release EasyColab Runtimes")), "danger")
         self.release_all_btn.clicked.connect(self._confirm_release_all_vms)
         card.body.addWidget(self.release_all_btn)
 
@@ -1120,10 +1120,10 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
     def _confirm_release_all_vms(self) -> None:
         ans = QMessageBox.question(
             self,
-            tr("释放所有 Colab 实例？", "Release All Colab Runtimes?"),
+            tr("释放 EasyColab 实例？", "Release EasyColab Runtimes?"),
             tr(
-                "账号下所有运行中的 Colab GPU 实例将被销毁，计费立即归零。\n确认立即释放吗？",
-                "All active Colab GPU runtimes on your account will be terminated and billing will stop immediately.\nConfirm release now?",
+                "将断开当前服务，并释放此安装创建的 Colab 实例。\n确认立即释放吗？",
+                "Disconnect the current service and release Colab runtimes created by this installation.\nConfirm release now?",
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -1415,15 +1415,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
                 )
             )
 
-        if self.vm.active_vm_count > 0:
-            self.release_all_btn.setText(
-                tr(
-                    f"释放全部实例 ({self.vm.active_vm_count} 台运行中)",
-                    f"Release All Runtimes ({self.vm.active_vm_count} Active)",
-                )
-            )
-        else:
-            self.release_all_btn.setText(tr("释放全部实例", "Release All Runtimes"))
+        self.release_all_btn.setText(tr("释放 EasyColab 实例", "Release EasyColab Runtimes"))
         self.release_all_btn.setEnabled(not self.vm.is_releasing_colab)
 
         # 3. Model Center Cards & Co-Residency

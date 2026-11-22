@@ -66,6 +66,8 @@ private data class RuntimeSessionRecord(
     val url: String,
     val endpoint: String,
     val accelerator: String,
+    val notebookHash: String,
+    val highMem: Boolean,
     val kernelId: String? = null,
     val sessionId: String? = null
 )
@@ -104,33 +106,43 @@ class ColabNativeBridge private constructor(context: Context) {
         "https://www.googleapis.com/auth/userinfo.profile",
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/colaboratory",
-        "https://www.googleapis.com/auth/drive.file"
+        "https://www.googleapis.com/auth/colaboratory"
     )
 
-    private val secureDir = File(context.filesDir, "easycolab_secure").apply { mkdirs() }
-    private val credsFile = File(secureDir, "oauth_creds.json")
-    private val sessionFile = File(secureDir, "colab_session.json")
-    private val customOAuthFile = File(secureDir, "custom_oauth_client.json")
-    private val pkceStateFile = File(secureDir, "pkce_state.json")
+    private val secrets = StudioSecrets(context)
+    private val credsSlot = "oauth_creds.json"
+    private val sessionSlot = "easycolab_owned_session_v2"
+    private val customOAuthSlot = "custom_oauth_client.json"
+    private val pkceSlot = "pkce_state.json"
 
+    init {
+        val directory = File(context.filesDir, "easycolab_secure")
+        for (name in listOf(credsSlot, customOAuthSlot, pkceSlot)) {
+            secrets.migrateLegacyFile(File(directory, name))
+        }
+        // Older session records have no notebook hash to prove ownership.
+        for (name in listOf("colab_session.json", "easycolab_owned_session_v1.json")) {
+            File(directory, name).delete()
+        }
+    }
+
+    private val runtimeMutex = Mutex()
     private val mutex = Mutex()
-    private var pendingVerifier: String? = null
-    private var pendingRedirectUri: String? = null
 
     private val httpClient = OkHttpClient.Builder()
+        .followRedirects(false)
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    fun hasCustomOAuthConfig(): Boolean = customOAuthFile.exists()
+    fun hasCustomOAuthConfig(): Boolean = secrets.read(customOAuthSlot).isNotEmpty()
 
     private fun loadActiveOAuthClient(): Pair<String, String> {
-        if (customOAuthFile.exists()) {
+        if (secrets.read(customOAuthSlot).isNotEmpty()) {
             try {
-                val obj = JSONObject(customOAuthFile.readText())
+                val obj = JSONObject(secrets.read(customOAuthSlot))
                 val cid = obj.optString("client_id", "")
                 val sec = obj.optString("client_secret", "")
                 if (cid.isNotBlank() && sec.isNotBlank()) return cid to sec
@@ -143,7 +155,7 @@ class ColabNativeBridge private constructor(context: Context) {
     suspend fun saveCustomOAuthJson(rawJson: String): Boolean = withContext(Dispatchers.IO) {
         val trimmed = rawJson.trim()
         if (trimmed.isEmpty()) {
-            customOAuthFile.delete()
+            secrets.save(customOAuthSlot, "")
             return@withContext false
         }
         val root = JSONObject(trimmed)
@@ -154,7 +166,7 @@ class ColabNativeBridge private constructor(context: Context) {
             throw ColabBridgeException(L("JSON 中缺少 client_id 或 client_secret", "Missing client_id or client_secret in JSON"))
         }
         val saved = JSONObject().put("client_id", cid).put("client_secret", sec)
-        customOAuthFile.writeText(saved.toString())
+        secrets.save(customOAuthSlot, saved.toString())
         true
     }
 
@@ -167,13 +179,13 @@ class ColabNativeBridge private constructor(context: Context) {
             .put("clientSecret", creds.clientSecret)
             .put("scopes", JSONArray(creds.scopes))
             .put("email", creds.email)
-        credsFile.writeText(obj.toString())
+        secrets.save(credsSlot, obj.toString())
     }
 
     private fun loadCredentials(): StoredOAuthCredentials? {
-        if (!credsFile.exists()) return null
+        val raw = secrets.read(credsSlot).takeIf { it.isNotEmpty() } ?: return null
         return try {
-            val obj = JSONObject(credsFile.readText())
+            val obj = JSONObject(raw)
             StoredOAuthCredentials(
                 accessToken = obj.optString("accessToken", ""),
                 refreshToken = obj.optString("refreshToken", ""),
@@ -189,15 +201,17 @@ class ColabNativeBridge private constructor(context: Context) {
     }
 
     private fun loadSessionRecord(): RuntimeSessionRecord? {
-        if (!sessionFile.exists()) return null
+        val raw = secrets.read(sessionSlot).takeIf { it.isNotEmpty() } ?: return null
         return try {
-            val obj = JSONObject(sessionFile.readText())
+            val obj = JSONObject(raw)
             RuntimeSessionRecord(
                 name = obj.optString("name", "easycolab"),
                 token = obj.optString("token", ""),
                 url = obj.optString("url", ""),
                 endpoint = obj.optString("endpoint", ""),
                 accelerator = obj.optString("accelerator", "G4"),
+                notebookHash = obj.getString("notebookHash"),
+                highMem = obj.getBoolean("highMem"),
                 kernelId = obj.optStringOrNull("kernelId"),
                 sessionId = obj.optStringOrNull("sessionId")
             )
@@ -208,7 +222,7 @@ class ColabNativeBridge private constructor(context: Context) {
 
     private fun saveSessionRecord(rec: RuntimeSessionRecord?) {
         if (rec == null) {
-            sessionFile.delete()
+            secrets.save(sessionSlot, "")
             return
         }
         val obj = JSONObject()
@@ -217,18 +231,18 @@ class ColabNativeBridge private constructor(context: Context) {
             .put("url", rec.url)
             .put("endpoint", rec.endpoint)
             .put("accelerator", rec.accelerator)
+            .put("notebookHash", rec.notebookHash)
+            .put("highMem", rec.highMem)
             .put("kernelId", rec.kernelId ?: JSONObject.NULL)
             .put("sessionId", rec.sessionId ?: JSONObject.NULL)
-        sessionFile.writeText(obj.toString())
+        secrets.save(sessionSlot, obj.toString())
     }
 
     suspend fun logout() = withContext(Dispatchers.IO) {
         mutex.withLock {
-            credsFile.delete()
-            sessionFile.delete()
-            pkceStateFile.delete()
-            pendingVerifier = null
-            pendingRedirectUri = null
+            secrets.save(credsSlot, "")
+            secrets.save(sessionSlot, "")
+            secrets.save(pkceSlot, "")
         }
     }
 
@@ -258,11 +272,11 @@ class ColabNativeBridge private constructor(context: Context) {
                     redirectUri = remoteRedirectUri
                 }
 
-                pendingVerifier = verifier
-                pendingRedirectUri = redirectUri
-                pkceStateFile.writeText(
-                    JSONObject().put("verifier", verifier).put("redirectUri", redirectUri).toString()
-                )
+                secrets.save(pkceSlot, JSONObject()
+                    .put("verifier", verifier)
+                    .put("redirectUri", redirectUri)
+                    .put("state", stateStr)
+                    .toString())
 
                 val urlBuilder = "https://accounts.google.com/o/oauth2/v2/auth".toHttpUrl().newBuilder()
                     .addQueryParameter("response_type", "code")
@@ -287,42 +301,31 @@ class ColabNativeBridge private constructor(context: Context) {
             }
         }
 
-    suspend fun exchangeAuthCode(rawInput: String, overrideRedirectUri: String? = null): NativeAuthStatus =
+    suspend fun exchangeAuthCode(rawInput: String): NativeAuthStatus =
         withContext(Dispatchers.IO) {
             val trimmed = rawInput.trim()
             if (trimmed.isEmpty()) {
                 return@withContext NativeAuthStatus(ok = false, loggedIn = false, email = "", error = "Empty code")
             }
 
-            var code = trimmed
-            if (trimmed.contains(":/") || trimmed.contains("code=") || trimmed.contains("error=")) {
-                try {
-                    val uri = Uri.parse(trimmed)
-                    val oauthErr = uri.getQueryParameter("error")
-                    if (!oauthErr.isNullOrEmpty()) {
-                        return@withContext NativeAuthStatus(ok = false, loggedIn = false, email = "", error = oauthErr)
-                    }
-                    val extracted = uri.getQueryParameter("code")
-                    if (!extracted.isNullOrEmpty()) {
-                        code = extracted
-                    }
-                } catch (_: Exception) {
-                }
+            val pending = runCatching { JSONObject(secrets.read(pkceSlot)) }.getOrNull()
+            val verifier = pending?.optString("verifier").orEmpty()
+            val activeRedirectUri = pending?.optString("redirectUri").orEmpty()
+            val state = pending?.optString("state").orEmpty()
+            if (verifier.isEmpty() || activeRedirectUri.isEmpty() || state.isEmpty()) {
+                return@withContext NativeAuthStatus(false, false, "", error = "Start a new sign-in session")
             }
-
-            var persistedVerifier: String? = null
-            var persistedRedirect: String? = null
-            if (pkceStateFile.exists()) {
-                try {
-                    val st = JSONObject(pkceStateFile.readText())
-                    persistedVerifier = st.optStringOrNull("verifier")
-                    persistedRedirect = st.optStringOrNull("redirectUri")
-                } catch (_: Exception) {
+            val code = if (trimmed.contains(":/")) {
+                val uri = Uri.parse(trimmed)
+                if (uri.buildUpon().clearQuery().fragment(null).build().toString() != activeRedirectUri ||
+                    uri.getQueryParameter("state") != state) {
+                    return@withContext NativeAuthStatus(false, false, "", error = "OAuth callback does not match the sign-in session")
                 }
+                uri.getQueryParameter("code").orEmpty()
+            } else {
+                trimmed
             }
-
-            val verifier = pendingVerifier ?: persistedVerifier ?: ""
-            val activeRedirectUri = overrideRedirectUri ?: pendingRedirectUri ?: persistedRedirect ?: remoteRedirectUri
+            if (code.isBlank()) return@withContext NativeAuthStatus(false, false, "", error = "Missing authorization code")
             val (clientId, clientSecret) = loadActiveOAuthClient()
 
             val formBuilder = FormBody.Builder()
@@ -331,9 +334,7 @@ class ColabNativeBridge private constructor(context: Context) {
                 .add("client_secret", clientSecret)
                 .add("redirect_uri", activeRedirectUri)
                 .add("grant_type", "authorization_code")
-            if (verifier.isNotEmpty()) {
-                formBuilder.add("code_verifier", verifier)
-            }
+            formBuilder.add("code_verifier", verifier)
 
             val req = Request.Builder()
                 .url("https://oauth2.googleapis.com/token")
@@ -352,17 +353,18 @@ class ColabNativeBridge private constructor(context: Context) {
                     }
 
                     val accessToken = json.optString("access_token", "")
-                    val refreshToken = json.optStringOrNull("refresh_token")?.takeIf { it.isNotEmpty() }
-                        ?: loadCredentials()?.refreshToken.orEmpty()
                     val expiresIn = json.optDouble("expires_in", 3500.0)
                     val scopeStr = json.optString("scope", publicScopes.joinToString(" "))
                     val email = fetchUserEmail(accessToken)
+                    val refreshToken = json.optString("refresh_token").ifEmpty {
+                        loadCredentials()?.takeIf {
+                            email.isNotBlank() && it.email == email && it.clientId == clientId
+                        }?.refreshToken.orEmpty()
+                    }
 
                     mutex.withLock {
                         saveSessionRecord(null)
-                        pkceStateFile.delete()
-                        pendingVerifier = null
-                        pendingRedirectUri = null
+                        secrets.save(pkceSlot, "")
                         saveCredentials(
                             StoredOAuthCredentials(
                                 accessToken = accessToken,
@@ -520,68 +522,49 @@ class ColabNativeBridge private constructor(context: Context) {
         return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
     }
 
-    private suspend fun unassignEndpoint(endpoint: String) {
-        if (endpoint.isEmpty()) return
-        try {
-            val getResp = colabTunnelRequest("/tun/m/unassign/$endpoint", method = "GET")
-            val xsrf = getResp.optString("token", "")
-            if (xsrf.isNotEmpty()) {
-                colabTunnelRequest(
-                    "/tun/m/unassign/$endpoint",
-                    method = "POST",
-                    extraHeaders = mapOf("X-Goog-Colab-Token" to xsrf)
-                )
-            }
-        } catch (_: Exception) {
+    private fun assignmentParameters(hash: String, accelerator: String, highMem: Boolean) =
+        buildList {
+            add("nbh" to hash)
+            add("variant" to "GPU")
+            add("accelerator" to accelerator)
+            if (highMem) add("shape" to "hm")
         }
+
+    private suspend fun verifiedSession(record: RuntimeSessionRecord): RuntimeSessionRecord? {
+        val reply = colabTunnelRequest("/tun/m/assign", queryParams =
+            assignmentParameters(record.notebookHash, record.accelerator, record.highMem))
+        val proxy = reply.optJSONObject("runtimeProxyInfo")
+        if (proxy == null) {
+            if (reply.optString("token").isNotEmpty()) return null
+            throw ColabBridgeException("Unable to verify runtime ownership")
+        }
+        if (reply.optString("endpoint") != record.endpoint) return null
+        val token = proxy.getString("token")
+        val url = proxy.getString("url")
+        require(token.isNotEmpty() && url.toHttpUrl().isHttps) { "Invalid Colab runtime proxy" }
+        return record.copy(token = token, url = url)
+    }
+
+    private suspend fun releaseSession(record: RuntimeSessionRecord): Boolean {
+        if (verifiedSession(record) == null) return false
+        val path = "/tun/m/unassign/${record.endpoint}"
+        val token = colabTunnelRequest(path).getString("token")
+        check(token.isNotBlank()) { "Unable to release runtime" }
+        colabTunnelRequest(path, method = "POST", extraHeaders = mapOf("X-Goog-Colab-Token" to token))
+        return true
     }
 
     suspend fun stopAll(): NativeAuthStatus = withContext(Dispatchers.IO) {
-        if (loadCredentials() == null) {
-            return@withContext NativeAuthStatus(ok = false, loggedIn = false, email = "", error = "Not logged in")
-        }
-        var stoppedCount = 0
-        loadSessionRecord()?.let { rec ->
-            try {
-                executeCodeOnKernel(
-                    rec,
-                    """
-                    import urllib.request
-                    for _p in (27860, 7860):
-                        try:
-                            urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{_p}/minimax_api/comfyui/sync_drive', data=b'{}', headers={'Content-Type':'application/json'}, method='POST'), timeout=12)
-                            break
-                        except Exception:
-                            pass
-                    """.trimIndent(),
-                    timeoutMs = 15_000L
-                )
-            } catch (_: Exception) {
-            }
-            unassignEndpoint(rec.endpoint)
+        runtimeMutex.withLock {
+            val record = loadSessionRecord()
+            val stopped = record != null && releaseSession(record)
             saveSessionRecord(null)
-            stoppedCount += 1
+            fetchAuthStatus().copy(message = if (stopped) {
+                L("已释放本机创建的实例", "Released the runtime created on this device")
+            } else {
+                L("本机没有可释放的实例", "No runtime owned by this device to release")
+            })
         }
-
-        try {
-            for (item in listAssignments()) {
-                val ep = item.optString("endpoint", "")
-                if (ep.isNotEmpty()) {
-                    unassignEndpoint(ep)
-                    stoppedCount += 1
-                }
-            }
-        } catch (_: Exception) {
-        }
-
-        val st = fetchAuthStatus()
-        val rate = st.burnRateHourly ?: 0.0
-        st.copy(
-            message = L(
-                "已彻底释放全部云端实例 ($stoppedCount 台)！当前计费速率: ${String.format(Locale.US, "%.2f", rate)} CU/h",
-                "Terminated all cloud instances ($stoppedCount). Current burn rate: ${String.format(Locale.US, "%.2f", rate)} CU/h"
-            )
-        )
     }
 
     private fun webSafeNotebookHash(): String {
@@ -595,15 +578,12 @@ class ColabNativeBridge private constructor(context: Context) {
         val gpuDesc = if (accel == "G4") "G4 (RTX PRO 6000 · 96GB)" else accel
         onLog(L("正在向 Google Colab 申请分配 $gpuDesc 实例...", "Requesting $gpuDesc instance from Google Colab..."))
 
+        val previousEndpoints = listAssignments().map { it.optString("endpoint") }.toSet()
+        val notebookHash = webSafeNotebookHash()
         suspend fun performAssign(highMem: Boolean): JSONObject {
-            val q = mutableListOf(
-                "nbh" to webSafeNotebookHash(),
-                "variant" to "GPU",
-                "accelerator" to accel
-            )
-            if (highMem) q.add("shape" to "hm")
+            val q = assignmentParameters(notebookHash, accel, highMem)
             val getResp = colabTunnelRequest("/tun/m/assign", method = "GET", queryParams = q)
-            if (getResp.has("runtimeProxyInfo")) return getResp
+            if (getResp.has("runtimeProxyInfo")) throw ColabBridgeException("Colab returned an existing runtime for a new notebook")
             val xsrf = getResp.optString("token", "")
             if (xsrf.isEmpty()) {
                 throw ColabBridgeException(L("未能获取实例分配令牌，请检查账号 CU 余额", "Failed to obtain assignment token. Check CU balance."))
@@ -616,10 +596,13 @@ class ColabNativeBridge private constructor(context: Context) {
             )
         }
 
+        var highMem = useHighMem
         val resp = try {
-            performAssign(useHighMem)
+            performAssign(highMem)
         } catch (e: ColabBridgeException) {
-            if (e.httpCode == 400 && useHighMem) performAssign(false) else throw e
+            if (e.httpCode != 400 || !highMem) throw e
+            highMem = false
+            performAssign(false)
         }
 
         val endpoint = resp.optString("endpoint", "")
@@ -630,7 +613,8 @@ class ColabNativeBridge private constructor(context: Context) {
             throw ColabBridgeException(L("分配失败：账号可能无可用付费 CU 或当前 GPU 缺货，可尝试切换 L4 / A100", "Allocation failed: check paid CU balance or try L4 / A100."))
         }
 
-        val rec = RuntimeSessionRecord("easycolab", proxyToken, proxyUrl, endpoint, accel)
+        require(endpoint !in previousEndpoints && proxyUrl.toHttpUrl().isHttps) { "Cannot confirm a fresh Colab runtime" }
+        val rec = RuntimeSessionRecord("easycolab", proxyToken, proxyUrl, endpoint, accel, notebookHash, highMem)
         saveSessionRecord(rec)
         onLog(L("成功分配 $accel 云端虚拟机！正在等待容器内核就绪...", "Allocated $accel cloud VM! Waiting for Jupyter kernel..."))
         return rec
@@ -703,32 +687,7 @@ class ColabNativeBridge private constructor(context: Context) {
             }
         }
 
-    private suspend fun buildRcloneDriveConf(): String? {
-        val creds = try { validAccessToken() } catch (_: Exception) { return null }
-        if (creds.refreshToken.isEmpty()) return null
-        val driveScope = when {
-            creds.scopes.any { it.endsWith("/drive") } -> "drive"
-            creds.scopes.any { it.contains("drive.file") } -> "drive.file"
-            else -> ""
-        }
-        if (driveScope.isEmpty()) return null
-        val tokJson = JSONObject()
-            .put("access_token", creds.accessToken)
-            .put("token_type", "Bearer")
-            .put("refresh_token", creds.refreshToken)
-            .toString()
-        return listOf(
-            "[easycolab_gdrive]",
-            "type = drive",
-            "client_id = ${creds.clientId}",
-            "client_secret = ${creds.clientSecret}",
-            "scope = $driveScope",
-            "token = $tokJson",
-            ""
-        ).joinToString("\n")
-    }
-
-    private suspend fun resolveOrStartKernelId(session: RuntimeSessionRecord, cleanExtra: Boolean = false): String =
+    private suspend fun resolveOrStartKernelId(session: RuntimeSessionRecord): String =
         withContext(Dispatchers.IO) {
             val base = session.url.trimEnd('/')
             val kernelsUrl = "$base/api/kernels".toHttpUrl().newBuilder()
@@ -748,30 +707,8 @@ class ColabNativeBridge private constructor(context: Context) {
                     if (resp.isSuccessful) {
                         val arr = JSONArray(resp.body?.string().orEmpty())
                         val ids = (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optStringOrNull("id") }
-                        if (ids.isNotEmpty()) {
-                            val primary = if (session.kernelId != null && ids.contains(session.kernelId)) session.kernelId else ids.first()
-                            if (cleanExtra) {
-                                for (extra in ids) {
-                                    if (extra != primary) {
-                                        val delUrl = "$base/api/kernels/$extra".toHttpUrl().newBuilder()
-                                            .addQueryParameter("authuser", "0")
-                                            .addQueryParameter("colab-runtime-proxy-token", session.token)
-                                            .build()
-                                        try {
-                                            httpClient.newCall(
-                                                Request.Builder().url(delUrl).delete()
-                                                    .header("X-Colab-Client-Agent", "colab-cli")
-                                                    .header("X-Colab-Runtime-Proxy-Token", session.token)
-                                                    .header("Authorization", "Bearer ${session.token}")
-                                                    .build()
-                                            ).execute().close()
-                                        } catch (_: Exception) {
-                                        }
-                                    }
-                                }
-                            }
-                            return@withContext primary
-                        }
+                        val owned = session.kernelId
+                        if (owned != null && owned in ids) return@withContext owned
                     }
                 }
             } catch (_: Exception) {
@@ -819,7 +756,7 @@ class ColabNativeBridge private constructor(context: Context) {
         timeoutMs: Long,
         onStdoutLine: ((String) -> Unit)? = null
     ): List<String> = withContext(Dispatchers.IO) {
-        val kernelId = resolveOrStartKernelId(session, cleanExtra = true)
+        val kernelId = resolveOrStartKernelId(session)
         val sessionId = session.sessionId ?: UUID.randomUUID().toString().lowercase(Locale.US)
         val updated = session.copy(kernelId = kernelId, sessionId = sessionId)
         saveSessionRecord(updated)
@@ -941,50 +878,33 @@ class ColabNativeBridge private constructor(context: Context) {
 
     suspend fun wakeAndDeploy(
         gpuType: String,
-        appPyBytes: ByteArray,
+        appPyBytes: ByteArray, runtimeAuth: ByteArray, bootstrap: ByteArray, password: String,
         onLog: (String) -> Unit
     ): String = withContext(Dispatchers.IO) {
+        runtimeMutex.withLock { deploy(gpuType, appPyBytes, runtimeAuth, bootstrap, password, onLog) }
+    }
+
+    private suspend fun deploy(
+        gpuType: String, appPyBytes: ByteArray, runtimeAuth: ByteArray, bootstrap: ByteArray,
+        password: String, onLog: (String) -> Unit
+    ): String {
         validAccessToken()
         val requestedAccel = (listOf("G4", "H100", "A100", "L4", "T4")
             .firstOrNull { it.equals(gpuType, ignoreCase = true) } ?: "G4").uppercase(Locale.US)
 
         onLog(L("正在检查账号下已有的 Colab 云端实例...", "Checking active Colab cloud instances on your account..."))
-        val assignments = try { listAssignments() } catch (_: Exception) { emptyList() }
-        var activeSession = loadSessionRecord()
-
-        assignments.firstOrNull()?.let { first ->
-            val ep = first.optString("endpoint", "")
-            val acc = first.optString("accelerator", "")
-            val proxy = first.optJSONObject("runtimeProxyInfo")
-            val tok = proxy?.optString("token", "").orEmpty()
-            val url = proxy?.optString("url", "").orEmpty()
-            if (ep.isNotEmpty() && tok.isNotEmpty() && url.isNotEmpty()) {
-                if (activeSession == null || activeSession?.endpoint == ep) {
-                    activeSession = RuntimeSessionRecord(
-                        name = "easycolab",
-                        token = tok,
-                        url = url,
-                        endpoint = ep,
-                        accelerator = acc.ifEmpty { requestedAccel },
-                        kernelId = activeSession?.kernelId,
-                        sessionId = activeSession?.sessionId
-                    )
-                    saveSessionRecord(activeSession)
-                }
-            }
-        }
-
+        var activeSession = loadSessionRecord()?.let { verifiedSession(it) }
         activeSession?.let { cur ->
             if (!cur.accelerator.equals(requestedAccel, ignoreCase = true)) {
                 onLog(L("当前实例型号为 [${cur.accelerator}]，正在释放并切换为 [$requestedAccel]...", "Releasing [${cur.accelerator}] and switching to [$requestedAccel]..."))
-                unassignEndpoint(cur.endpoint)
+                releaseSession(cur)
                 saveSessionRecord(null)
                 activeSession = null
             } else {
                 onLog(L("正在检查已有实例 (${cur.accelerator}) 连通性...", "Checking existing (${cur.accelerator}) runtime connectivity..."))
                 if (!waitForRuntimeReady(cur, 15_000L)) {
                     onLog(L("旧实例已过期，正在自动清理并分配全新实例...", "Previous runtime expired; allocating a fresh VM..."))
-                    unassignEndpoint(cur.endpoint)
+                    releaseSession(cur)
                     saveSessionRecord(null)
                     activeSession = null
                 }
@@ -1009,119 +929,19 @@ class ColabNativeBridge private constructor(context: Context) {
         }
         if (lastErr != null) throw lastErr
 
-        buildRcloneDriveConf()?.let { conf ->
-            try {
-                uploadFileToColab(targetSession, conf.toByteArray(Charsets.UTF_8), "content/.easycolab_rclone.conf")
-            } catch (_: Exception) {
-            }
-        }
-
-        onLog(L("正在云端配置 Google Drive 持久化、多模型引擎并启动隧道 (约需 40~90 秒)...", "Configuring Google Drive persistence, multi-model engine & public tunnel (~40–90s)..."))
-
-        val bootCode = """
-import os, sys, time, re, shutil, subprocess
-
-rc_stage = "/content/.easycolab_rclone.conf"
-if os.path.exists(rc_stage):
-    rc_dir = os.path.expanduser("~/.config/rclone")
-    os.makedirs(rc_dir, mode=0o700, exist_ok=True)
-    rc_dst = os.path.join(rc_dir, "rclone.conf")
-    shutil.move(rc_stage, rc_dst)
-    os.chmod(rc_dst, 0o600)
-
-if os.path.exists(os.path.expanduser("~/.config/rclone/rclone.conf")):
-    if not shutil.which("rclone"):
-        subprocess.run(
-            ["bash", "-lc", "curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip && unzip -q -o /tmp/rclone.zip -d /tmp && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone && rm -rf /tmp/rclone*"],
-            check=False,
-        )
-    if shutil.which("rclone") and not os.path.ismount("/content/drive/MyDrive"):
-        subprocess.run(["rclone", "mkdir", "easycolab_gdrive:EasyColab_Drive"], check=False)
-        if os.path.exists("/dev/fuse") and (shutil.which("fusermount3") or shutil.which("fusermount")):
-            os.makedirs("/content/drive/MyDrive", exist_ok=True)
-            subprocess.Popen(
-                [
-                    "rclone", "mount", "easycolab_gdrive:EasyColab_Drive", "/content/drive/MyDrive",
-                    "--vfs-cache-mode", "writes",
-                    "--vfs-write-back", "3s",
-                    "--dir-cache-time", "15s",
-                    "--drive-chunk-size", "64M",
-                    "--buffer-size", "32M",
-                    "--allow-non-empty",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for _ in range(10):
-                if os.path.ismount("/content/drive/MyDrive"):
-                    print("已通过 Google OAuth 自动挂载 Google Drive (/content/drive/MyDrive)！", flush=True)
-                    break
-                time.sleep(0.5)
-            else:
-                try:
-                    if not os.listdir("/content/drive/MyDrive"):
-                        os.rmdir("/content/drive/MyDrive")
-                except Exception:
-                    pass
-
-if not os.path.exists("/content/DiffSynth-Studio"):
-    print("正在克隆 DiffSynth-Studio...", flush=True)
-    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/modelscope/DiffSynth-Studio.git", "/content/DiffSynth-Studio"], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "bitsandbytes", "huggingface_hub", "hf_transfer", "qwen-vl-utils", "einops", "kernels>=0.17.2,<0.18.0", "av", "gradio", "modelscope", "imageio", "imageio-ffmpeg", "scipy", "soundfile", "librosa"], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "fla-core", "flash-linear-attention"], check=False)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--only-binary=:all:", "causal-conv1d"], check=False)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", "/content/DiffSynth-Studio"], check=True)
-else:
-    try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        import kernels
-    except Exception:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "einops", "kernels>=0.17.2,<0.18.0"], check=False)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--force-reinstall", "fla-core", "flash-linear-attention"], check=False)
-
-subprocess.run(["pkill", "-f", "python.*/content/app.py"], check=False)
-subprocess.run(["pkill", "-f", "llama-server"], check=False)
-time.sleep(1)
-
-log_path = "/content/easycolab_server.log"
-if os.path.exists(log_path):
-    os.remove(log_path)
-
-with open(log_path, "w") as out_f:
-    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", stdout=out_f, stderr=subprocess.STDOUT)
-
-url_re = re.compile(r"https://[a-zA-Z0-9.-]+\.gradio\.live")
-found_url = None
-for _ in range(90):
-    time.sleep(2)
-    if os.path.exists(log_path):
-        txt = open(log_path, "r", errors="replace").read()
-        m = url_re.search(txt)
-        if m:
-            found_url = m.group(0)
-            break
-
-if found_url:
-    print("WAKE_URL:" + found_url, flush=True)
-else:
-    tail = open(log_path, "r", errors="replace").read()[-600:] if os.path.exists(log_path) else "no log"
-    print("WAKE_ERROR: 启动超时，日志尾部: " + tail, flush=True)
-        """.trimIndent()
-
-        val lines = try {
-            executeCodeOnKernel(targetSession, bootCode, timeoutMs = 300_000L) { line ->
-                if (!line.startsWith("WAKE_URL:")) onLog(line.removePrefix("WAKE_LOG: "))
-            }
-        } catch (_: Exception) {
-            val fresh = targetSession.copy(kernelId = null, sessionId = null)
-            saveSessionRecord(fresh)
-            executeCodeOnKernel(fresh, bootCode, timeoutMs = 300_000L) { line ->
-                if (!line.startsWith("WAKE_URL:")) onLog(line.removePrefix("WAKE_LOG: "))
-            }
+        uploadFileToColab(targetSession, runtimeAuth, "content/runtime_auth.py")
+        uploadFileToColab(targetSession, bootstrap, "content/mobile_bootstrap.py")
+        val stageName = ".easycolab-admin-" + UUID.randomUUID()
+        uploadFileToColab(targetSession, password.toByteArray(Charsets.US_ASCII), "content/$stageName")
+        val bootCode = "import runpy; runpy.run_path('/content/mobile_bootstrap.py')['start']('/content/$stageName')"
+        val lines = executeCodeOnKernel(targetSession, bootCode, timeoutMs = 300_000L) { line ->
+            if (!line.startsWith("WAKE_URL:")) onLog(line)
         }
 
         lines.firstOrNull { it.startsWith("WAKE_URL:") }?.let {
-            return@withContext it.removePrefix("WAKE_URL:").trim()
+            val address = it.removePrefix("WAKE_URL:").trim()
+            require(Regex("""https://[A-Za-z0-9-]+\.gradio\.live""").matches(address)) { "Invalid tunnel address" }
+            return address
         }
         lines.firstOrNull { it.startsWith("WAKE_ERROR:") }?.let {
             throw ColabBridgeException(it)
@@ -1133,36 +953,21 @@ else:
         if (loadCredentials() == null) {
             return@withContext NativeAuthStatus(ok = true, loggedIn = false, email = "")
         }
-        try {
-            listAssignments().firstOrNull()?.let { first ->
-                val ep = first.optString("endpoint", "")
-                val acc = first.optString("accelerator", "")
-                val proxy = first.optJSONObject("runtimeProxyInfo")
-                val tok = proxy?.optString("token", "").orEmpty()
-                val url = proxy?.optString("url", "").orEmpty()
-                if (ep.isNotEmpty() && tok.isNotEmpty() && url.isNotEmpty()) {
-                    try {
-                        colabTunnelRequest(
-                            "/tun/m/$ep/keep-alive/",
-                            method = "GET",
-                            extraHeaders = mapOf("X-Colab-Tunnel" to "Google")
-                        )
-                    } catch (_: Exception) {
-                    }
-                    val prev = loadSessionRecord()
-                    val updated = RuntimeSessionRecord("easycolab", tok, url, ep, acc, prev?.kernelId, prev?.sessionId)
-                    saveSessionRecord(updated)
-                    try {
-                        executeCodeOnKernel(
-                            updated,
-                            "import pathlib; pathlib.Path('/tmp/.easycolab_client_hb').touch(); _easycolab_hb = 1",
-                            timeoutMs = 12_000L
-                        )
-                    } catch (_: Exception) {
-                    }
+        if (runtimeMutex.tryLock()) {
+            try {
+                val owned = loadSessionRecord()?.let { verifiedSession(it) }
+                if (owned != null) {
+                    colabTunnelRequest("/tun/m/${owned.endpoint}/keep-alive/",
+                        extraHeaders = mapOf("X-Colab-Tunnel" to "Google"))
+                    executeCodeOnKernel(owned,
+                        "import pathlib; pathlib.Path('/tmp/.easycolab_client_hb').touch()",
+                        timeoutMs = 12_000L)
                 }
+            } catch (_: Exception) {
+                // Quota reporting is still available when the runtime is offline.
+            } finally {
+                runtimeMutex.unlock()
             }
-        } catch (_: Exception) {
         }
         fetchAuthStatus()
     }

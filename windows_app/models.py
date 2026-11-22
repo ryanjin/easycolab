@@ -141,11 +141,14 @@ _SERVER_EXACT_MAP: Dict[str, str] = {
         "Configuring Google Drive persistence, engines & tunnel (~40-90s)..."
     ),
     "尚未授权登录 Google 账号，请先点击「绑定账号」": "Google account not authorized. Please click Bind first.",
-    "已释放全部云端实例": "All cloud runtimes released",
-    "已释放全部云端实例。": "All cloud runtimes released.",
+    "部分 EasyColab 实例释放失败，请重试。": "Some EasyColab runtimes could not be released. Try again.",
 }
 
 _SERVER_REGEX_RULES: List[Tuple[re.Pattern[str], object]] = [
+    (
+        re.compile(r"^已释放 ([0-9]+/[0-9]+) 个 EasyColab 实例。当前账号计费速率: ([0-9.]+) CU/小时$"),
+        r"Released \1 EasyColab runtimes. Current account usage is \2 CU/hour.",
+    ),
     (
         re.compile(r"^已无缝接管在线 ComfyUI 画布（(.+?)）$"),
         lambda m: f"Reconnected to active ComfyUI canvas ({localize_server_text(m.group(1))})",

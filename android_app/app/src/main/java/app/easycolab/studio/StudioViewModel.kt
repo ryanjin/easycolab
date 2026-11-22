@@ -37,6 +37,9 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Credentials
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -62,7 +65,29 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     internal val prefs = appContext.getSharedPreferences("easycolab_prefs", Context.MODE_PRIVATE)
     internal val bridge = ColabNativeBridge.getInstance(appContext)
 
+    private val secrets = StudioSecrets(appContext)
+    private fun origin(url: HttpUrl?): String? =
+        url?.takeIf { it.isHttps && it.username.isEmpty() && it.password.isEmpty() }?.let { "https://${it.host}:${it.port}" }
+
+    internal val publicModelClient = OkHttpClient.Builder()
+        .followRedirects(false)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+
     internal val apiClient = OkHttpClient.Builder()
+        .followRedirects(false)
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val expected = origin(colabServerURL.trim().toHttpUrlOrNull())
+            val password = expected?.let { secrets.read("admin:$it") }.orEmpty()
+            if (expected == null || expected != origin(request.url) || password.isEmpty()) {
+                throw java.io.IOException("An HTTPS server address and management password are required")
+            }
+            chain.proceed(request.newBuilder()
+                .header("Authorization", Credentials.basic("easycolab", password))
+                .build())
+        }
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
@@ -85,16 +110,30 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     fun updateColabServerURL(url: String) {
+        val next = origin(url.trim().toHttpUrlOrNull())
+        if (next != origin(colabServerURL.trim().toHttpUrlOrNull())) {
+            adminPassword = next?.let { secrets.read("admin:$it") }.orEmpty()
+        }
         colabServerURL = url
         prefs.edit().putString("colabServerURL", url).apply()
     }
 
-    var hfToken by mutableStateOf(prefs.getString("hfToken", "") ?: "")
+    var adminPassword by mutableStateOf(origin(colabServerURL.trim().toHttpUrlOrNull())?.let { secrets.read("admin:$it") }.orEmpty())
+        private set
+
+    fun updateAdminPassword(value: String) {
+        adminPassword = value
+        origin(colabServerURL.trim().toHttpUrlOrNull())?.let {
+            if (!secrets.write("admin:$it", value)) showToast(L("无法保存管理密码", "Unable to save the management password"))
+        }
+    }
+
+    var hfToken by mutableStateOf(secrets.read("hfToken"))
         private set
 
     fun updateHfToken(token: String) {
         hfToken = token
-        prefs.edit().putString("hfToken", token).apply()
+        secrets.write("hfToken", token)
     }
 
     var autoSaveToGallery by mutableStateOf(prefs.getBoolean("autoSaveToGallery", true))
@@ -284,19 +323,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     var presencePenalty by mutableFloatStateOf(0.0f)
     val chatHistory = mutableStateListOf<ChatTurnItem>()
 
-    var apiKeyEnabled by mutableStateOf(prefs.getBoolean("apiKeyEnabled", true))
-        private set
-
-    fun updateApiKeyEnabled(enabled: Boolean) {
-        apiKeyEnabled = enabled
-        prefs.edit().putBoolean("apiKeyEnabled", enabled).apply()
-        viewModelScope.launch { syncApiKeyToColab() }
-    }
-
     var apiAccessKey by mutableStateOf(
-        prefs.getString("apiAccessKey", null)?.takeIf { it.isNotBlank() } ?: run {
+        secrets.read("apiAccessKey").takeIf { it.isNotBlank() } ?: run {
             val gen = "sk-colab-" + UUID.randomUUID().toString().replace("-", "").take(20).lowercase(Locale.US)
-            prefs.edit().putString("apiAccessKey", gen).apply()
+            secrets.write("apiAccessKey", gen)
             gen
         }
     )
@@ -304,7 +334,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateApiAccessKey(newKey: String) {
         apiAccessKey = newKey
-        prefs.edit().putString("apiAccessKey", newKey).apply()
+        secrets.write("apiAccessKey", newKey)
     }
 
     var apiRequestCount by mutableIntStateOf(0)
@@ -506,7 +536,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun copyToClipboard(context: Context, label: String, text: String, toastText: String? = null) {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        cm?.setPrimaryClip(ClipData.newPlainText(label, text))
+        val clip = ClipData.newPlainText(label, text)
+        clip.description.extras = android.os.PersistableBundle().apply {
+            putBoolean("android.content.extra.IS_SENSITIVE", true)
+        }
+        cm?.setPrimaryClip(clip)
         toastText?.let { showToast(it) }
     }
 
@@ -748,9 +782,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (isWakingColab) return
 
         viewModelScope.launch {
-            val appPyBytes = try {
+            val resources = try {
                 withContext(Dispatchers.IO) {
-                    appContext.assets.open("app.py").use { it.readBytes() }
+                    listOf("app.py", "runtime_auth.py", "mobile_bootstrap.py").map { name ->
+                        appContext.assets.open(name).use { it.readBytes() }
+                    }
                 }
             } catch (e: Exception) {
                 statusMessage = L("读取内置 app.py 失败: ${e.message}", "Missing bundled app.py in APK assets: ${e.message}")
@@ -765,7 +801,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             appendConsoleLine(L("=== 启动原生免网页唤醒 ($wakeGPUChoice) ===", "=== Starting Native Headless Wake ($wakeGPUChoice) ==="))
 
             try {
-                val tunnelUrl = bridge.wakeAndDeploy(wakeGPUChoice, appPyBytes) { logLine ->
+                val password = UUID.randomUUID().toString() + UUID.randomUUID().toString()
+                val (engine, runtimeAuth, bootstrap) = resources
+                val tunnelUrl = bridge.wakeAndDeploy(wakeGPUChoice, engine, runtimeAuth, bootstrap, password) { logLine ->
                     viewModelScope.launch {
                         val localized = localizeServerText(stripEmoji(logLine))
                         appendConsoleLine(localized)
@@ -774,6 +812,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 isWakingColab = false
                 updateColabServerURL(tunnelUrl)
+                updateAdminPassword(password)
                 showToast(L("云端 $wakeGPUChoice 已唤醒并自动连接！", "Cloud $wakeGPUChoice Ready & Connected!"))
                 checkColabStatus(silent = false)
                 refreshOfficialColabAccountUsage()
@@ -789,29 +828,29 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun disconnectRemoteColab() {
         viewModelScope.launch {
-            statusMessage = L("正在释放全部云端 Colab 实例并归零计费...", "Terminating all cloud Colab VMs & stopping billing...")
-            val base = normalizedBaseURL
-            if (base.isNotEmpty()) {
-                withContext(Dispatchers.IO) {
-                    try {
-                        val req = Request.Builder()
-                            .url("$base/minimax_api/disconnect")
-                            .post("{}".toRequestBody("application/json".toMediaType()))
-                            .build()
-                        apiClient.newCall(req).execute().close()
-                    } catch (_: Exception) {
+            statusMessage = L("正在释放所选实例…", "Releasing the selected runtime…")
+            try {
+                if (cliLoggedIn) {
+                    val result = bridge.stopAll()
+                    result.paidBalance?.let { officialCUBalance = it }
+                    officialBurnRate = result.burnRateHourly ?: 0.0
+                    activeVMCount = result.activeAssignments
+                    statusMessage = result.message.orEmpty()
+                } else {
+                    val base = normalizedBaseURL.takeIf { it.isNotEmpty() } ?: return@launch
+                    withContext(Dispatchers.IO) {
+                        val request = Request.Builder().url("$base/minimax_api/disconnect")
+                            .post("{}".toRequestBody("application/json".toMediaType())).build()
+                        apiClient.newCall(request).execute().use {
+                            check(it.isSuccessful) { "HTTP ${it.code}" }
+                        }
                     }
+                    statusMessage = L("已向所选服务发送释放指令。", "Sent shutdown request to the selected runtime.")
                 }
-            }
-            if (cliLoggedIn) {
-                val res = bridge.stopAll()
-                res.paidBalance?.let { officialCUBalance = it }
-                officialBurnRate = res.burnRateHourly ?: 0.0
-                activeVMCount = res.activeAssignments
-                statusMessage = res.message ?: L("已彻底释放全部云端实例，计费归零。", "All cloud instances terminated (0 CU/h).")
-                showToast(L("已释放实例 · 0.00 CU/h", "Instances Terminated · 0 CU/h"))
-            } else {
-                statusMessage = L("已向服务端发送释放关机指令。", "Sent shutdown command to cloud runtime.")
+                showToast(statusMessage)
+            } catch (error: Exception) {
+                statusMessage = L("释放失败", "Release failed") + ": " + error.message.orEmpty()
+                return@launch
             }
             pendingJobId = null
             resetStaleRemoteRuntimeState("")
@@ -1041,9 +1080,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         apiRequestCount = json.optInt("api_request_count", apiRequestCount)
-        if (apiKeyEnabled && !json.optBoolean("api_key_enabled", false) && !remoteApiKeySynced) {
+        if (!json.optBoolean("api_key_configured", false) && !remoteApiKeySynced) {
             remoteApiKeySynced = true
-            viewModelScope.launch { syncApiKeyToColab() }
+            viewModelScope.launch { syncApiKeyToColab(initializeOnly = true) }
         }
 
         json.optJSONArray("console_lines")?.takeIf { it.length() > 0 }?.let { cArr ->
@@ -1340,11 +1379,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { syncApiKeyToColab() }
     }
 
-    suspend fun syncApiKeyToColab() {
+    suspend fun syncApiKeyToColab(initializeOnly: Boolean = false) {
         val base = normalizedBaseURL.takeIf { it.isNotEmpty() && isConnected } ?: return
-        val key = if (apiKeyEnabled) apiAccessKey.trim() else ""
+        val key = apiAccessKey.trim().takeIf { it.isNotEmpty() } ?: return
         try {
-            postJsonForStatus("$base/minimax_api/config_api_key", JSONObject().put("api_key", key))?.let {
+            postJsonForStatus("$base/minimax_api/config_api_key", JSONObject().put("api_key", key).put("initialize_only", initializeOnly))?.let {
                 remoteApiKeySynced = true
                 applyStatusJson(it)
             }

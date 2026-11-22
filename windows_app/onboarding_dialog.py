@@ -69,8 +69,8 @@ def get_onboarding_steps() -> List[Tuple[str, str, str]]:
                 "Outputs auto-download to local Videos folder + 30-min idle auto-shutdown",
             ),
             tr(
-                "提示：创作结束后点击左下角「释放全部实例」，确保计费速率立即归零。",
-                "Tip: Click 'Release All Runtimes' at bottom-left when finished so CU burn drops to zero immediately.",
+                "创作结束后，点击左下角「释放 EasyColab 实例」可释放此安装创建的实例。",
+                "When finished, click 'Release EasyColab Runtimes' to release runtimes created by this installation.",
             ),
         ),
     ]
@@ -313,8 +313,8 @@ class ColabGuideDialog(QDialog):
         c1 = self._make_card(
             tr("1. 绑定 Google 账号（仅首次需要一次）", "1. Bind Google Account (One-time setup)"),
             tr(
-                "点击左侧「绑定」按钮完成官方 OAuth 授权，凭证仅加密保存在你本机的 ~/.config/colab-cli/token.json，自动同步真实 CU 计算单元余额。",
-                "Click 'Bind' in the left sidebar to complete official OAuth login. Credentials stay locally in ~/.config/colab-cli/token.json and sync live CU balance.",
+                "点击左侧「绑定」按钮完成官方 OAuth 授权，授权凭据保存在本机，自动同步真实 CU 计算单元余额。",
+                "Click 'Bind' in the left sidebar to complete official OAuth login. Credentials stay on this device. The client shows your current CU balance.",
             ),
             row1,
         )
@@ -458,12 +458,12 @@ class ColabGuideDialog(QDialog):
         )
         c2 = self._make_card(
             tr(
-                "2. 开启 30 分钟自动休眠 + 用完点「释放全部实例」立省 CU 额度",
-                "2. 30-Min Idle Auto-Sleep + 'Release All Runtimes' to Save CU",
+                "2. 自动休眠与释放 EasyColab 实例",
+                "2. Auto-Sleep and Releasing EasyColab Runtimes",
             ),
             tr(
-                "内置闲置自动释放看门狗（默认 30 分钟无操作自动销毁实例）。当天创作结束时，点击左下角红色「释放全部实例」即可立即停止计费。",
-                "Built-in idle watchdog (auto-terminates runtime after 30 min idle by default). Click the red 'Release All Runtimes' button when done to stop CU billing immediately.",
+                "内置闲置自动释放看门狗（默认 30 分钟无操作自动销毁实例）。创作结束后，点击「释放 EasyColab 实例」可释放此安装创建的实例。账号总用量请在 Colab 中查看。",
+                "Built-in idle watchdog (auto-terminates runtime after 30 min idle by default). When finished, click 'Release EasyColab Runtimes' to release runtimes created by this installation. Check Colab for total account usage.",
             ),
         )
         c3 = self._make_card(

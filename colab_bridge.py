@@ -8,7 +8,7 @@ Supports:
   - auth_code   : Exchange Google authorization code and save ~/.config/colab-cli/token.json
   - wake        : Provision/reuse Colab GPU VM (G4/H100/A100/L4/T4), deploy app.py, and return gradio.live URL
   - keepalive   : Refresh Colab runtime proxy & kernel activity while active
-  - stop_all    : Unassign and terminate all active Colab VMs on the account (verify 0 CU/hr burn)
+  - stop_all    : Stop only the runtimes allocated by this EasyColab installation
 """
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ import time
 import uuid
 import signal
 import argparse
+import hashlib
+import sqlite3
 import tempfile
 import threading
 import contextlib
@@ -31,7 +33,7 @@ from importlib import resources
 import requests
 import websocket
 from websocket import ABNF
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -90,14 +92,17 @@ def _sync_macos_system_proxies_to_env():
 _sync_macos_system_proxies_to_env()
 os.environ.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "75")
 
-from colab_cli.auth import PUBLIC_SCOPES, TOKEN_CONFIG_PATH, REMOTE_REDIRECT_URI
+from colab_cli import auth as colab_auth
+from colab_cli.auth import PUBLIC_SCOPES, REMOTE_REDIRECT_URI
 from colab_cli.common import state
 from colab_cli.client import (
     Accelerator,
+    Client,
+    Prod,
     Variant,
     Shape,
     resolve_assign_shape,
-    PostAssignmentResponse,
+    Assignment,
     ColabRequestError,
     TooManyAssignmentsError,
 )
@@ -116,51 +121,103 @@ def _load_client_config() -> dict:
     return json.loads(res.read_text(encoding="utf-8"))
 
 
-def _has_valid_token() -> bool:
-    if not os.path.exists(TOKEN_CONFIG_PATH):
-        return False
+def _write_private_file(path, contents: str):
+    """Publish a complete, owner-only file, including when replacing older credentials."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=directory)
     try:
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
-        if creds and creds.valid:
-            return True
-        if creds and creds.expired and creds.refresh_token:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+# 0.8 moved the CLI's OAuth token to the system credential store. Both
+# versions use the same installed-app OAuth client and copy/paste flow.
+USES_KEYRING = hasattr(colab_auth, "LEGACY_TOKEN_PATH")
+TOKEN_CONFIG_PATH = colab_auth.LEGACY_TOKEN_PATH if USES_KEYRING else colab_auth.TOKEN_CONFIG_PATH
+
+
+class BridgeAuthError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _remove_if_present(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _save_credentials(creds, *, remove_legacy=False):
+    try:
+        if USES_KEYRING:
+            colab_auth._save_token_to_keyring(creds.to_json())
+            if remove_legacy:
+                _remove_if_present(TOKEN_CONFIG_PATH)
+        else:
+            _write_private_file(TOKEN_CONFIG_PATH, creds.to_json())
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not save Google credentials. Unlock the system credential store and check access to the Colab CLI settings folder.") from error
+
+
+def _load_credentials():
+    """Load existing credentials without running the CLI's interactive login."""
+    try:
+        stored = colab_auth._get_token_from_keyring() if USES_KEYRING else None
+        if stored:
+            creds = Credentials.from_authorized_user_info(json.loads(stored), PUBLIC_SCOPES)
+        else:
+            if not os.path.isfile(TOKEN_CONFIG_PATH):
+                return None
+            if os.name == "posix" and os.stat(TOKEN_CONFIG_PATH).st_mode & 0o077:
+                os.chmod(TOKEN_CONFIG_PATH, 0o600)
+            creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not read Google credentials. Unlock the system credential store or bind the account again.") from error
+
+    refreshed = False
+    if not creds.valid and creds.refresh_token:
+        try:
             creds.refresh(Request())
-            with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
-            return True
-    except Exception:
-        return False
-    return False
+        except Exception as error:
+            raise BridgeAuthError("oauth_refresh", "Could not refresh Google authorization. Check the network and bind the account again if authorization expired.") from error
+        refreshed = True
+    if not creds.valid:
+        return None
+    migrate = USES_KEYRING and not stored
+    if refreshed or migrate:
+        _save_credentials(creds, remove_legacy=migrate)
+    return creds
+
+
+def _authenticated_credentials():
+    creds = _load_credentials()
+    if creds is not None:
+        # state.client otherwise asks the upstream CLI to authenticate again.
+        # It may read terminal input if the store is locked or unavailable.
+        state._client = Client(Prod(), AuthorizedSession(creds))
+    return creds
+
+
+def _has_valid_token() -> bool:
+    return _authenticated_credentials() is not None
 
 
 PKCE_VERIFIER_PATH = os.path.expanduser("~/.config/colab-cli/pkce_verifier.txt")
 ACCOUNT_PROFILE_CACHE_PATH = os.path.expanduser("~/.config/colab-cli/account_profile.json")
 
 
-def _clear_local_session_store():
-    """切换或退出 Google 账号时，清理本地缓存的旧账号 Colab 会话记录"""
+def _get_account_email(creds) -> str:
+    """Cache profile metadata by token fingerprint."""
     try:
-        existing = state.store.list()
-        if isinstance(existing, dict):
-            for name in list(existing.keys()):
-                state.store.remove(name)
-    except Exception:
-        pass
-    state._client = None
-    state._sessions = None
-
-
-def _get_account_email() -> str:
-    """获取当前绑定 Google 账号邮箱（按 refresh_token 指纹本地缓存，避免重复请求）"""
-    if not os.path.exists(TOKEN_CONFIG_PATH):
-        return ""
-    try:
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
-        tok_fp = (creds.refresh_token or creds.token or "")[-20:]
+        token = creds.refresh_token or creds.token
+        tok_fp = hashlib.sha256(token.encode()).hexdigest() if token else ""
         if tok_fp and os.path.exists(ACCOUNT_PROFILE_CACHE_PATH):
             try:
                 with open(ACCOUNT_PROFILE_CACHE_PATH, "r", encoding="utf-8") as cf:
@@ -178,61 +235,69 @@ def _get_account_email() -> str:
             if r.status_code == 200:
                 email = str(r.json().get("email") or "").strip()
                 if email and tok_fp:
-                    os.makedirs(os.path.dirname(ACCOUNT_PROFILE_CACHE_PATH), exist_ok=True)
-                    with open(ACCOUNT_PROFILE_CACHE_PATH, "w", encoding="utf-8") as cf:
-                        json.dump({"fp": tok_fp, "email": email}, cf)
+                    _write_private_file(ACCOUNT_PROFILE_CACHE_PATH, json.dumps({"fp": tok_fp, "email": email}))
                 return email
     except Exception:
         pass
     return ""
 
 
+def _oauth_flow():
+    try:
+        flow = InstalledAppFlow.from_client_config(_load_client_config(), PUBLIC_SCOPES, autogenerate_code_verifier=True)
+        flow.redirect_uri = REMOTE_REDIRECT_URI
+        return flow
+    except Exception as error:
+        raise BridgeAuthError("oauth_config", "Could not load the Google OAuth client configuration. Check the custom OAuth JSON or reinstall the Colab CLI dependency.") from error
+
+
 def cmd_auth_url():
-    client_config = _load_client_config()
-    flow = InstalledAppFlow.from_client_config(client_config, PUBLIC_SCOPES)
-    flow.redirect_uri = REMOTE_REDIRECT_URI
-    # 显式传入 select_account consent，强制弹出 Google 多账号选择器以支持自由切换账号
-    auth_url, _ = flow.authorization_url(prompt="select_account consent", token_usage="remote")
-    os.makedirs(os.path.dirname(PKCE_VERIFIER_PATH), exist_ok=True)
-    if getattr(flow, "code_verifier", None):
-        with open(PKCE_VERIFIER_PATH, "w", encoding="utf-8") as f:
-            f.write(flow.code_verifier)
+    flow = _oauth_flow()
+    try:
+        auth_url, _ = flow.authorization_url(prompt="select_account consent", token_usage="remote")
+    except Exception as error:
+        raise BridgeAuthError("oauth_config", "Could not build the Google authorization link. Check the OAuth client configuration.") from error
+    try:
+        _write_private_file(PKCE_VERIFIER_PATH, flow.code_verifier)
+    except (OSError, TypeError) as error:
+        raise BridgeAuthError("oauth_verifier", "Could not save the sign-in verifier. Check write access to the Colab CLI settings folder.") from error
     print(json.dumps({"ok": True, "auth_url": auth_url}))
 
 
 def cmd_auth_code(code: str):
+    flow = _oauth_flow()
     try:
-        client_config = _load_client_config()
-        flow = InstalledAppFlow.from_client_config(client_config, PUBLIC_SCOPES)
-        flow.redirect_uri = REMOTE_REDIRECT_URI
-        if os.path.exists(PKCE_VERIFIER_PATH):
-            with open(PKCE_VERIFIER_PATH, "r", encoding="utf-8") as f:
-                flow.code_verifier = f.read().strip()
+        with open(PKCE_VERIFIER_PATH, encoding="utf-8") as stream:
+            flow.code_verifier = stream.read().strip()
+        if not flow.code_verifier:
+            raise ValueError("empty verifier")
+    except (OSError, ValueError) as error:
+        raise BridgeAuthError("oauth_verifier", "Start Google account binding again to generate a new sign-in verifier.") from error
+    try:
         flow.fetch_token(code=code.strip())
         creds = flow.credentials
-        _clear_local_session_store()
-        for p in (ACCOUNT_PROFILE_CACHE_PATH, PKCE_VERIFIER_PATH):
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        os.makedirs(os.path.dirname(TOKEN_CONFIG_PATH), exist_ok=True)
-        with open(TOKEN_CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
-        return cmd_auth_status()
-    except Exception as e:
-        print(json.dumps({"ok": False, "logged_in": False, "error": str(e)}))
+    except Exception as error:
+        raise BridgeAuthError("oauth_exchange", "Google authorization failed. Check the network and use a fresh authorization code from the most recent sign-in link.") from error
+
+    _save_credentials(creds, remove_legacy=True)
+    state._client = None
+    _remove_if_present(ACCOUNT_PROFILE_CACHE_PATH)
+    _remove_if_present(PKCE_VERIFIER_PATH)
+    cmd_auth_status()
 
 
 def cmd_auth_logout():
-    _clear_local_session_store()
-    for p in (TOKEN_CONFIG_PATH, PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    try:
+        if USES_KEYRING and colab_auth._get_token_from_keyring() is not None:
+            colab_auth._run_with_timeout(
+                colab_auth.keyring.delete_password, colab_auth.KEYRING_SERVICE_NAME,
+                colab_auth.KEYRING_USERNAME, timeout=colab_auth.KEYRING_TIMEOUT_SECONDS,
+            )
+        for path in (TOKEN_CONFIG_PATH, PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
+            _remove_if_present(path)
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not remove Google credentials. Unlock the system credential store and retry signing out.") from error
+    state._client = None
     print(json.dumps({"ok": True, "logged_in": False, "email": ""}))
 
 
@@ -243,48 +308,102 @@ def _quiet_colab_cli():
         yield
 
 
-def _safe_sync_sessions():
-    for attempt in range(3):
-        try:
-            with _quiet_colab_cli():
-                # 重置 colab_cli 进程内缓存，确保每次都重新读取 sessions.json 并对比云端最新分配
-                state._sessions = None
-                return state.sync_sessions()
-        except Exception:
-            if attempt == 2:
-                try:
-                    with _quiet_colab_cli():
-                        listed = state.store.list()
-                except Exception:
-                    listed = []
-                if isinstance(listed, dict):
-                    cached = dict(listed)
-                else:
-                    cached = {s.name: s for s in listed if getattr(s, "name", None)}
-                return cached, []
-            time.sleep(1.2)
+# The Colab CLI session store can contain browser and other CLI workloads. A private,
+# durable notebook UUID lets Google identify our allocation even after a lost POST reply.
+SESSION_DB = os.path.expanduser("~/.config/easycolab/sessions.sqlite3")
+
+
+@contextlib.contextmanager
+def _session_db():
+    os.makedirs(os.path.dirname(SESSION_DB), mode=0o700, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(SESSION_DB)) as db, db:
+        db.execute("""CREATE TABLE IF NOT EXISTS notebooks (
+            gpu TEXT PRIMARY KEY, notebook_id TEXT UNIQUE NOT NULL, high_ram INTEGER NOT NULL DEFAULT 0,
+            endpoint TEXT, kernel_id TEXT, session_id TEXT
+        )""")
+        yield db
+
+
+def _notebook_id(accel: Accelerator) -> uuid.UUID:
+    with _session_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO notebooks (gpu, notebook_id) VALUES (?, ?)",
+            (accel.value, str(uuid.uuid4())),
+        )
+        row = db.execute("SELECT notebook_id FROM notebooks WHERE gpu = ?", (accel.value,)).fetchone()
+    return uuid.UUID(row[0])
+
+
+def _session_for_notebook(gpu, assignment, high_ram):
+    proxy = assignment.runtime_proxy_info
+    with _session_db() as db:
+        db.execute(
+            """UPDATE notebooks SET endpoint = ?, kernel_id = NULL, session_id = ?
+               WHERE gpu = ? AND endpoint IS NOT ?""",
+            (assignment.endpoint, uuid.uuid4().hex, gpu, assignment.endpoint),
+        )
+        kernel_id, session_id = db.execute(
+            "SELECT kernel_id, session_id FROM notebooks WHERE gpu = ?", (gpu,)
+        ).fetchone()
+    return SessionState(
+        name="easycolab", endpoint=assignment.endpoint, token=proxy.token, url=proxy.url,
+        token_expires_at=proxy.expires_at(), session_id=session_id, kernel_id=kernel_id,
+        variant=Variant.GPU.value, accelerator=gpu,
+        machine_shape=Shape.HIGH_RAM.name if high_ram else Shape.STANDARD.name,
+    )
+
+
+def _remember_kernel(session):
+    # An older process must never overwrite the replacement VM's kernel metadata.
+    with _session_db() as db:
+        db.execute(
+            "UPDATE notebooks SET kernel_id = ?, session_id = ? WHERE gpu = ? AND endpoint = ?",
+            (session.kernel_id, session.session_id, session.accelerator, session.endpoint),
+        )
+
+
+def _owned_sessions():
+    with _session_db() as db:
+        notebooks = list(db.execute("SELECT gpu, notebook_id, high_ram FROM notebooks"))
+    if not notebooks:
+        return {}
+    # A previously used accelerator can become unavailable on another subscription.
+    # Skip inactive types before asking Google about a particular notebook.
+    active = {a.endpoint: a.accelerator.value for a in state.client.list_assignments()}
+    sessions = {}
+    for gpu, notebook_id, high_ram in notebooks:
+        if gpu not in active.values():
+            continue
+        # This is a GET-only lookup by our private notebook UUID. The other response
+        # type is an unallocated notebook with an XSRF token. Never POST from here.
+        assignment = state.client._get_assignment(
+            uuid.UUID(notebook_id), Variant.GPU, Accelerator(gpu), Shape.HIGH_RAM if high_ram else None
+        )
+        if isinstance(assignment, Assignment) and active.get(assignment.endpoint) == gpu:
+            sessions[assignment.endpoint] = _session_for_notebook(gpu, assignment, high_ram)
+    return sessions
 
 
 def cmd_auth_status():
-    if not _has_valid_token():
+    creds = _authenticated_credentials()
+    if creds is None:
         print(json.dumps({"ok": True, "logged_in": False}))
         return
 
     try:
         info = state.client.get_consumption_user_info()
-        local_sessions, assignments = _safe_sync_sessions()
-        name_by_ep = {s.endpoint: s.name for s in local_sessions.values()}
+        assignments = state.client.list_assignments()
         sess_list = []
         for a in assignments:
             sess_list.append({
-                "name": name_by_ep.get(a.endpoint, "colab-vm"),
+                "name": "colab-vm",
                 "endpoint": a.endpoint,
                 "accelerator": a.accelerator.value,
                 "variant": a.variant.name,
                 "shape": a.machine_shape.name,
             })
 
-        email = _get_account_email()
+        email = _get_account_email(creds)
         print(json.dumps({
             "ok": True,
             "logged_in": True,
@@ -298,67 +417,9 @@ def cmd_auth_status():
         print(json.dumps({
             "ok": False,
             "logged_in": True,
-            "email": _get_account_email(),
+            "email": _get_account_email(creds),
             "error": str(e),
         }))
-
-
-ADC_PUBLIC_CLIENT_PREFIX = "764086051850-"
-
-
-def _build_rclone_drive_conf(token_path: str = TOKEN_CONFIG_PATH) -> str:
-    """
-    当用户配置了自有 Google Cloud OAuth Client（或显式携带 quota_project_id）时，
-    生成云端 rclone Google Drive 备用配置。
-    注：colab-cli 内置的公共 ADC Client (764086051850-*) 未绑定 quota_project 时访问
-    drive.googleapis.com 会被 Google 直接返回 403 SERVICE_DISABLED，此时跳过 rclone 配置，
-    生成的成片由客户端自动拉取保存至本地电脑。
-    """
-    if not os.path.exists(token_path):
-        return ""
-    try:
-        with open(token_path, "r", encoding="utf-8") as rf:
-            pre_raw = json.load(rf)
-        pre_cid = str(pre_raw.get("client_id") or "").strip()
-        pre_qp = str(pre_raw.get("quota_project_id") or "").strip()
-        if pre_cid.startswith(ADC_PUBLIC_CLIENT_PREFIX) and not pre_qp:
-            return ""
-
-        creds = Credentials.from_authorized_user_file(token_path, PUBLIC_SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(token_path, "w", encoding="utf-8") as f:
-                f.write(creds.to_json())
-        raw = json.loads(creds.to_json())
-        client_id = str(raw.get("client_id") or "").strip()
-        quota_project = str(raw.get("quota_project_id") or "").strip()
-        if client_id.startswith(ADC_PUBLIC_CLIENT_PREFIX) and not quota_project:
-            return ""
-        scopes = raw.get("scopes") or []
-        drive_scope = "drive" if any(s.endswith("/drive") for s in scopes) else (
-            "drive.file" if any("drive.file" in s for s in scopes) else ""
-        )
-        if not drive_scope or not raw.get("token") or not raw.get("refresh_token"):
-            return ""
-        tok_obj = {
-            "access_token": raw["token"],
-            "token_type": "Bearer",
-            "refresh_token": raw["refresh_token"],
-        }
-        if raw.get("expiry"):
-            tok_obj["expiry"] = raw["expiry"]
-        lines = [
-            "[easycolab_gdrive]",
-            "type = drive",
-            f"client_id = {client_id}",
-            f"client_secret = {raw.get('client_secret', '')}",
-            f"scope = {drive_scope}",
-            f"token = {json.dumps(tok_obj, separators=(',', ':'))}",
-            "",
-        ]
-        return "\n".join(lines)
-    except Exception:
-        return ""
 
 
 def _unassign_endpoints_and_wait_quota_release(endpoints: list[str], wait_s: float = 8.0) -> int:
@@ -403,9 +464,8 @@ def cmd_stop_all():
         return
 
     try:
-        local_sessions, assignments = _safe_sync_sessions()
-        endpoints_to_release: list[str] = []
-        for s in list(local_sessions.values()):
+        local_sessions = _owned_sessions()
+        for s in local_sessions.values():
             try:
                 with _quiet_colab_cli():
                     rt = ColabRuntime(s.url, s.token, kernel_id=s.kernel_id)
@@ -436,26 +496,17 @@ def cmd_stop_all():
                     rt.stop(shutdown_kernel=True)
             except Exception:
                 pass
-            if getattr(s, "endpoint", None):
-                endpoints_to_release.append(s.endpoint)
-            with _quiet_colab_cli():
-                state.store.remove(s.name)
-
-        # 同时清理所有未在本地登记的云端孤儿实例 (Orphan VMs)，去重并等待配额归零
-        for a in assignments:
-            if getattr(a, "endpoint", None):
-                endpoints_to_release.append(a.endpoint)
-
-        stopped_count = _unassign_endpoints_and_wait_quota_release(endpoints_to_release, wait_s=8.0)
+        stopped_count = _unassign_endpoints_and_wait_quota_release(list(local_sessions), wait_s=8.0)
 
         info = state.client.get_consumption_user_info()
         print(json.dumps({
-            "ok": True,
+            "ok": stopped_count == len(local_sessions),
             "stopped_count": stopped_count,
             "paid_balance": round(float(info.paid_compute_units_balance), 2),
             "burn_rate_hourly": round(float(info.consumption_rate_hourly), 2),
             "active_assignments": int(info.assignments_count),
-            "message": f"🛑 已彻底释放全部云端实例！当前计费速率: {info.consumption_rate_hourly:.2f} CU/小时",
+            "message": f"已释放 {stopped_count}/{len(local_sessions)} 个 EasyColab 实例。当前账号计费速率: {info.consumption_rate_hourly:.2f} CU/小时",
+            "error": None if stopped_count == len(local_sessions) else "部分 EasyColab 实例释放失败，请重试。",
         }))
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}))
@@ -528,43 +579,6 @@ def _candidate_shapes_for_accel(accel: Accelerator) -> list:
     return [primary, None] if primary is not None else [None]
 
 
-def _session_from_listed_assignment(a, session_name: str = "easycolab", existing: SessionState | None = None) -> SessionState:
-    return SessionState(
-        name=existing.name if existing and getattr(existing, "name", None) else session_name,
-        token=a.runtime_proxy_info.token,
-        url=a.runtime_proxy_info.url,
-        endpoint=a.endpoint,
-        token_expires_at=a.runtime_proxy_info.expires_at(),
-        kernel_id=getattr(existing, "kernel_id", None) if existing and existing.endpoint == a.endpoint else None,
-        session_id=(
-            getattr(existing, "session_id", None)
-            if existing and existing.endpoint == a.endpoint and getattr(existing, "session_id", None)
-            else uuid.uuid4().hex
-        ),
-        variant=Variant.GPU.value,
-        accelerator=a.accelerator.value,
-        machine_shape=Shape.HIGH_RAM.name if a.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
-    )
-
-
-def _try_adopt_matching_cloud_assignment(accel: Accelerator, session_name: str = "easycolab") -> SessionState | None:
-    """
-    当 POST /tun/m/assign 出现网关 504 / ReadTimeout / 503 重试时，立即核对云端真实 list_assignments()：
-    若 Google 后端实际上已在后台完成该型号机器分配，直接纳管返回，杜绝产生孤儿机器占满高配 GPU 名额。
-    """
-    try:
-        assignments = state.client.list_assignments()
-    except Exception:
-        return None
-    for a in assignments:
-        if a.accelerator == accel:
-            s = _session_from_listed_assignment(a, session_name=session_name)
-            with _quiet_colab_cli():
-                state.store.add(s)
-            return s
-    return None
-
-
 @contextlib.contextmanager
 def _single_shot_colab_assign():
     """禁用 colab_cli 内部静默阻塞 70 秒的英文重试循环，交由 EasyColab 透明重试并实时对账云端分配"""
@@ -579,12 +593,12 @@ def _single_shot_colab_assign():
             os.environ["COLAB_CLI_ASSIGN_RETRIES"] = prev_retries
 
 
-def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
+def _allocate_fresh_session(gpu_type: str) -> SessionState:
     accel = _resolve_gpu_accel(gpu_type)
     gpu_desc = _gpu_display_label(accel)
     shape_candidates = list(_candidate_shapes_for_accel(accel))
     rejected_400_shapes = set()
-    nbh_by_shape = {sh: uuid.uuid4() for sh in shape_candidates}
+    notebook_id = _notebook_id(accel)
 
     print(f"WAKE_LOG: 🚀 正在向 Google Colab 申请分配 {gpu_desc} 实例...", flush=True)
 
@@ -592,7 +606,6 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
     retry_delays = [6.0, 10.0]
     attempt = 0
     shape_idx = 0
-    cleaned_412_orphans = False
     last_err_tag = "HTTP 503"
     res = None
     chosen_shape = shape_candidates[0]
@@ -600,27 +613,14 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
     while attempt < max_attempts:
         valid_shapes = [sh for sh in shape_candidates if sh not in rejected_400_shapes] or [None]
         chosen_shape = valid_shapes[shape_idx % len(valid_shapes)]
-        nbh = nbh_by_shape.setdefault(chosen_shape, uuid.uuid4())
+        with _session_db() as db:
+            db.execute("UPDATE notebooks SET high_ram = ? WHERE gpu = ?", (chosen_shape == Shape.HIGH_RAM, accel.value))
 
         try:
             with _quiet_colab_cli(), _single_shot_colab_assign():
-                res = state.client.assign(nbh, variant=Variant.GPU, accelerator=accel, shape=chosen_shape)
+                res = state.client.assign(notebook_id, variant=Variant.GPU, accelerator=accel, shape=chosen_shape)
             break
         except TooManyAssignmentsError as quota_err:
-            adopted = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
-            if adopted is not None:
-                print(f"WAKE_LOG: ✅ 检测到云端已在后台完成 {accel.value} 实例分配，直接接管！", flush=True)
-                return adopted
-            if not cleaned_412_orphans:
-                cleaned_412_orphans = True
-                try:
-                    lingering = [a.endpoint for a in state.client.list_assignments() if a.endpoint]
-                except Exception:
-                    lingering = []
-                if lingering:
-                    print("WAKE_LOG: 🧹 检测到账号下残留未释放实例占用并发名额，正在自动清理后重试...", flush=True)
-                    _unassign_endpoints_and_wait_quota_release(lingering, wait_s=8.0)
-                    continue
             raise RuntimeError(
                 f"Google Colab 拒绝分配 {gpu_desc} (HTTP 412)：当前账号并发实例数已达上限，或该时段高配机型触发临时配额限制。"
                 f"请确认未在其他浏览器标签页占用实例，稍后重试或临时切换为 A100 / L4。"
@@ -628,13 +628,6 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
         except (ColabRequestError, requests.exceptions.RequestException) as req_err:
             status = get_status_code(req_err) if isinstance(req_err, ColabRequestError) else None
 
-            # 1) 无论报 504/503/ReadTimeout，第一时间检查云端是否其实已经分配成功
-            adopted = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
-            if adopted is not None:
-                print(f"WAKE_LOG: ✅ 检测到云端已在后台完成 {accel.value} 实例分配，直接接管！", flush=True)
-                return adopted
-
-            # 2) 若当前机器规格报 400 Bad Request（如部分池不支持 shape=hm），立即切换候选规格且不消耗重试次数
             if status == 400 and chosen_shape is not None and None not in rejected_400_shapes:
                 rejected_400_shapes.add(chosen_shape)
                 shape_idx = 0
@@ -662,10 +655,6 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
                 flush=True,
             )
             time.sleep(delay)
-            adopted_after_wait = _try_adopt_matching_cloud_assignment(accel, session_name=session_name)
-            if adopted_after_wait is not None:
-                print(f"WAKE_LOG: ✅ 检测到云端已完成 {accel.value} 实例分配，直接接管！", flush=True)
-                return adopted_after_wait
 
     if res is None:
         raise RuntimeError(
@@ -673,43 +662,13 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
             f"（属于 Colab 官方高配机型时段性缺货，非本地客户端故障）。建议稍等几分钟再试，或在左侧临时切换为 A100 / L4 实例。"
         )
 
-    if isinstance(res, PostAssignmentResponse):
-        token = res.runtime_proxy_info.token
-        url = res.runtime_proxy_info.url
-        endpoint = res.endpoint
-        exp = res.runtime_proxy_info.expires_at()
-    else:
-        token = res.runtime_proxy_info.token if hasattr(res, "runtime_proxy_info") else getattr(res, "runtime_proxy_token", "")
-        url = res.runtime_proxy_info.url if hasattr(res, "runtime_proxy_info") else ""
-        endpoint = res.endpoint
-        exp = res.runtime_proxy_info.expires_at() if hasattr(res, "runtime_proxy_info") else None
-
-    s = SessionState(
-        name=session_name,
-        token=token,
-        url=url,
-        endpoint=endpoint,
-        token_expires_at=exp,
-        session_id=uuid.uuid4().hex,
-        variant=Variant.GPU.value,
-        accelerator=accel.value,
-        machine_shape=Shape.HIGH_RAM.name if chosen_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
-    )
-    with _quiet_colab_cli():
-        state.store.add(s)
+    s = _session_for_notebook(accel.value, res, chosen_shape == Shape.HIGH_RAM)
     print(f"WAKE_LOG: ✅ 成功分配 {accel.value} 云端虚拟机！正在等待容器内核就绪...", flush=True)
     return s
 
 
 def cmd_wake(gpu_type: str, app_py_path: str):
-    """
-    无浏览器一键唤醒 Colab GPU 并自动部署 EasyColab 多模型服务端：
-    1. 全量云端分配对账：遍历账号下全部云端 assignments（含未在本地登记的孤儿实例），优先复用同型号健康实例，
-       并彻底释放异构/残留孤儿实例且等待配额归零，杜绝孤儿机器占满 G4/H100 单实例配额导致 503/412
-    2. 等待容器 Jupyter 端点 (/api/kernels) TLS/HTTP 握手就绪，规避 SSLEOFError
-    3. 上传本地最新 app.py 到 /content/app.py
-    4. 在远端内核安装依赖并后台拉起 app.py，提取 https://xxxx.gradio.live 隧道链接返回给 Mac 客户端
-    """
+    """Reuse or allocate an EasyColab-owned GPU and deploy the bundled server."""
     if not _has_valid_token():
         print("WAKE_ERROR: 尚未授权登录 Google 账号，请先点击「🔑 绑定账号」", flush=True)
         return
@@ -728,80 +687,22 @@ def cmd_wake(gpu_type: str, app_py_path: str):
         return
 
     try:
-        session_name = "easycolab"
         requested_accel = _resolve_gpu_accel(gpu_type)
-        print("WAKE_LOG: 🔍 正在检查账号下已有的 Colab 实例...", flush=True)
-        local_sessions, assignments = _safe_sync_sessions()
-        ep_to_local = {
-            s.endpoint: s for s in local_sessions.values() if getattr(s, "endpoint", None)
-        }
-
-        preferred_local = (
-            local_sessions.get(session_name)
-            or local_sessions.get("aevix")
-            or local_sessions.get("minimax")
-            or (list(local_sessions.values())[0] if local_sessions else None)
-        )
-        if preferred_local and getattr(preferred_local, "name", None):
-            session_name = preferred_local.name
-
-        target_session: SessionState | None = None
-        matching_assignments = [a for a in assignments if a.accelerator == requested_accel]
-        other_assignments = [a for a in assignments if a.accelerator != requested_accel]
-        dead_matching_eps: list[str] = []
-
-        # 1) 优先在账号全部云端活跃分配中查找与目标 GPU 型号一致的健康实例（包含此前超时遗留但实际已创建成功的孤儿实例）
-        for a in matching_assignments:
-            existing_local = ep_to_local.get(a.endpoint)
-            candidate = _session_from_listed_assignment(a, session_name=session_name, existing=existing_local)
-            print(
-                f"WAKE_LOG: ♻️ 正在检查已有实例 [{candidate.name}] ({a.accelerator.value}) 连通性...",
-                flush=True,
-            )
-            if _wait_for_runtime_ready(candidate, timeout_s=18):
-                target_session = candidate
-                with _quiet_colab_cli():
-                    state.store.add(target_session)
+        print("WAKE_LOG: 正在检查此 EasyColab 安装创建的实例...", flush=True)
+        sessions = _owned_sessions()
+        target_session = None
+        for session in sessions.values():
+            if session.accelerator == requested_accel.value and _wait_for_runtime_ready(session, timeout_s=18):
+                target_session = session
                 break
-            else:
-                print(f"WAKE_LOG: ⚠️ 旧实例 ({a.endpoint[:18]}...) 已失效或正在销毁，准备清理...", flush=True)
-                dead_matching_eps.append(a.endpoint)
 
-        if target_session is not None:
-            # 已复用目标型号实例：顺带释放重复同型号孤儿实例及本地记录过的旧异构实例，防止双倍扣费
-            extra_eps = list(dead_matching_eps)
-            for a in matching_assignments:
-                if a.endpoint != target_session.endpoint:
-                    extra_eps.append(a.endpoint)
-            for s in list(local_sessions.values()):
-                if s.endpoint and s.endpoint != target_session.endpoint:
-                    extra_eps.append(s.endpoint)
-                if s.name != target_session.name:
-                    with _quiet_colab_cli():
-                        state.prune_session(s.name)
-            if extra_eps:
-                _unassign_endpoints_and_wait_quota_release(extra_eps, wait_s=5.0)
-        else:
-            # 2) 未找到可复用的目标型号实例：释放账号下占用的旧型号/失效孤儿实例并等待配额账本归零，再申请新机器
-            release_eps = list(dead_matching_eps) + [a.endpoint for a in other_assignments if a.endpoint]
-            for s in list(local_sessions.values()):
-                if getattr(s, "endpoint", None):
-                    release_eps.append(s.endpoint)
-                with _quiet_colab_cli():
-                    state.prune_session(s.name)
-
-            if release_eps:
-                old_labels = sorted({a.accelerator.value for a in other_assignments} | (
-                    {requested_accel.value} if dead_matching_eps else set()
-                ))
-                label_str = " / ".join(old_labels) if old_labels else "旧实例"
-                print(
-                    f"WAKE_LOG: 🔄 当前已占用实例 [{label_str}]，正在彻底释放并等待配额就绪以切换为 [{requested_accel.value}]...",
-                    flush=True,
-                )
-                _unassign_endpoints_and_wait_quota_release(release_eps, wait_s=8.0)
-
-            target_session = _allocate_fresh_session(session_name, gpu_type)
+        old_endpoints = [ep for ep in sessions if target_session is None or ep != target_session.endpoint]
+        if old_endpoints:
+            released = _unassign_endpoints_and_wait_quota_release(old_endpoints)
+            if released != len(old_endpoints):
+                raise RuntimeError("部分旧 EasyColab 实例释放失败，请重试。")
+        if target_session is None:
+            target_session = _allocate_fresh_session(gpu_type)
             if not _wait_for_runtime_ready(target_session, timeout_s=50):
                 print("WAKE_LOG: ⏳ 容器仍在初始化，继续尝试连接内核...", flush=True)
 
@@ -817,23 +718,6 @@ def cmd_wake(gpu_type: str, app_py_path: str):
                 time.sleep(2.5)
 
         contents.upload(os.path.join(os.path.dirname(app_py_path), "runtime_auth.py"), "content/runtime_auth.py")
-        rclone_conf_text = _build_rclone_drive_conf()
-        if rclone_conf_text:
-            tmp_rc_fd, tmp_rc_path = tempfile.mkstemp(prefix="easycolab_rc_", suffix=".conf")
-            try:
-                with os.fdopen(tmp_rc_fd, "w", encoding="utf-8") as rcf:
-                    rcf.write(rclone_conf_text)
-                os.chmod(tmp_rc_path, 0o600)
-                contents.upload(tmp_rc_path, "content/.easycolab_rclone.conf")
-            except Exception:
-                pass
-            finally:
-                if os.path.exists(tmp_rc_path):
-                    try:
-                        os.remove(tmp_rc_path)
-                    except Exception:
-                        pass
-
         print("WAKE_LOG: 正在云端配置 Google Drive 持久化、多模型引擎并启动隧道 (约需 40~90 秒)...", flush=True)
         boot_code = r"""
 import os, sys, time, re, shutil, subprocess
@@ -842,67 +726,26 @@ with open(ADMIN_STAGE, encoding="ascii") as stream:
     admin_password = stream.read()
 os.unlink(ADMIN_STAGE)
 
+# A previous release may have persisted a full Google refresh token. Do not start
+# third-party code in that runtime; leave unrelated rclone configuration untouched.
+legacy_stage = "/content/.easycolab_rclone.conf"
+legacy_config = os.path.expanduser("~/.config/rclone/rclone.conf")
+if os.path.lexists(legacy_stage):
+    raise RuntimeError("检测到旧版 EasyColab 云盘凭据文件，请撤销旧授权并使用新实例。")
+if os.path.isfile(legacy_config):
+    with open(legacy_config, encoding="utf-8", errors="replace") as config:
+        if any(line.strip().lower() == "[easycolab_gdrive]" for line in config):
+            raise RuntimeError("检测到旧版 EasyColab 云盘凭据配置，请撤销旧授权并使用新实例。")
+
+with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+    if any(" - fuse.rclone easycolab_gdrive:" in line for line in mounts):
+        raise RuntimeError("检测到旧版 EasyColab 云盘挂载，请撤销旧授权并使用新实例。")
+
 if not shutil.which("nginx"):
     subprocess.run(["apt-get", "update", "-qq"], check=True)
     subprocess.run(["apt-get", "install", "-y", "-qq", "nginx-light"], check=True)
     # apt may start the distribution's default site.
     subprocess.run(["service", "nginx", "stop"], check=False)
-
-# 0. 清理旧实例可能残留的公共 ADC 失效 rclone 配置；若未通过原生 DriveFS 挂载且用户配置了自有 OAuth rclone，则启用备用挂载
-rc_existing = os.path.expanduser("~/.config/rclone/rclone.conf")
-rc_stage = "/content/.easycolab_rclone.conf"
-if os.path.exists(rc_stage):
-    rc_dir = os.path.expanduser("~/.config/rclone")
-    os.makedirs(rc_dir, mode=0o700, exist_ok=True)
-    shutil.move(rc_stage, rc_existing)
-    os.chmod(rc_existing, 0o600)
-elif os.path.exists(rc_existing):
-    try:
-        rc_txt = open(rc_existing, "r", encoding="utf-8", errors="ignore").read()
-        if "client_id = 764086051850-" in rc_txt:
-            os.remove(rc_existing)
-    except Exception:
-        pass
-
-_native_drive_ok = (
-    os.path.isdir("/content/drive/MyDrive")
-    and os.path.exists("/content")
-    and os.stat("/content/drive/MyDrive").st_dev != os.stat("/content").st_dev
-)
-if not _native_drive_ok and os.path.exists(rc_existing):
-    if not shutil.which("rclone"):
-        subprocess.run(
-            ["bash", "-lc", "curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip && unzip -q -o /tmp/rclone.zip -d /tmp && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone && rm -rf /tmp/rclone*"],
-            check=False,
-        )
-    if shutil.which("rclone") and not os.path.ismount("/content/drive/MyDrive"):
-        mk_res = subprocess.run(["rclone", "mkdir", "easycolab_gdrive:EasyColab_Drive"], check=False)
-        if mk_res.returncode == 0 and os.path.exists("/dev/fuse") and (shutil.which("fusermount3") or shutil.which("fusermount")):
-            os.makedirs("/content/drive/MyDrive", exist_ok=True)
-            subprocess.Popen(
-                [
-                    "rclone", "mount", "easycolab_gdrive:EasyColab_Drive", "/content/drive/MyDrive",
-                    "--vfs-cache-mode", "writes",
-                    "--vfs-write-back", "3s",
-                    "--dir-cache-time", "15s",
-                    "--drive-chunk-size", "64M",
-                    "--buffer-size", "32M",
-                    "--allow-non-empty",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            for _ in range(10):
-                if os.path.ismount("/content/drive/MyDrive"):
-                    print("✅ 已通过自定义 OAuth 自动挂载 Google Drive (/content/drive/MyDrive)！", flush=True)
-                    break
-                time.sleep(0.5)
-            else:
-                try:
-                    if not os.listdir("/content/drive/MyDrive"):
-                        os.rmdir("/content/drive/MyDrive")
-                except Exception:
-                    pass
 
 # 1. 如果尚未安装 DiffSynth-Studio，自动快速安装 (含最新 transformers 以支持 Qwen3.8-27B)
 if not os.path.exists("/content/DiffSynth-Studio"):
@@ -956,11 +799,11 @@ else:
 
         def _on_kid(kid):
             target_session.kernel_id = kid
-            state.store.add(target_session)
+            _remember_kernel(target_session)
 
         def _on_sid(sid):
             target_session.session_id = sid
-            state.store.add(target_session)
+            _remember_kernel(target_session)
 
         def _run_boot_on_runtime(use_saved_kernel: bool):
             rt = ColabRuntime(
@@ -1035,46 +878,6 @@ def _session_token_ttl_seconds(s: SessionState) -> float:
     return 3600.0
 
 
-def _sync_and_adopt_sessions():
-    local_sessions, assignments = _safe_sync_sessions()
-    ep_map = {a.endpoint: a for a in assignments}
-
-    if not local_sessions and assignments:
-        a0 = assignments[0]
-        s_auto = SessionState(
-            name="easycolab",
-            token=a0.runtime_proxy_info.token,
-            url=a0.runtime_proxy_info.url,
-            endpoint=a0.endpoint,
-            token_expires_at=a0.runtime_proxy_info.expires_at(),
-            session_id=uuid.uuid4().hex,
-            variant=Variant.GPU.value,
-            accelerator=a0.accelerator.value,
-            machine_shape=Shape.HIGH_RAM.name if a0.machine_shape == Shape.HIGH_RAM else Shape.STANDARD.name,
-        )
-        with _quiet_colab_cli():
-            state.store.add(s_auto)
-        local_sessions = {"easycolab": s_auto}
-
-    for s in list(local_sessions.values()):
-        changed = False
-        if s.endpoint in ep_map:
-            info_proxy = ep_map[s.endpoint].runtime_proxy_info
-            if s.token != info_proxy.token or s.url != info_proxy.url:
-                changed = True
-            s.token = info_proxy.token
-            s.url = info_proxy.url
-            s.token_expires_at = info_proxy.expires_at()
-        if not getattr(s, "session_id", None):
-            s.session_id = uuid.uuid4().hex
-            changed = True
-        if changed:
-            with _quiet_colab_cli():
-                state.store.add(s)
-
-    return local_sessions, assignments
-
-
 def _touch_colab_tunnel_keepalive(endpoint: str) -> bool:
     if not endpoint:
         return False
@@ -1119,7 +922,7 @@ def _resolve_or_start_remote_kernel(s: SessionState, timeout_s: float = 12.0) ->
     if isinstance(kernels, list) and kernels:
         known_ids = [str(k.get("id")) for k in kernels if isinstance(k, dict) and k.get("id")]
         if known_ids:
-            active_kid = s.kernel_id if (s.kernel_id in known_ids) else known_ids[0]
+            active_kid = s.kernel_id if s.kernel_id in known_ids else None
 
     if not active_kid:
         pr = requests.post(
@@ -1147,8 +950,7 @@ def _resolve_or_start_remote_kernel(s: SessionState, timeout_s: float = 12.0) ->
         s.session_id = uuid.uuid4().hex
         changed = True
     if changed:
-        with _quiet_colab_cli():
-            state.store.add(s)
+        _remember_kernel(s)
     return active_kid
 
 
@@ -1256,7 +1058,7 @@ def cmd_keepalive():
         return
 
     try:
-        local_sessions, _ = _sync_and_adopt_sessions()
+        local_sessions = _owned_sessions()
         touched = 0
         warnings = []
 
@@ -1375,7 +1177,7 @@ def cmd_keepalive_daemon():
             min_ttl = min((_session_token_ttl_seconds(s) for s in local_sessions.values()), default=3600.0)
             if force_resync or (now - last_sync_ts) >= 480.0 or min_ttl < 600.0:
                 try:
-                    local_sessions, _ = _sync_and_adopt_sessions()
+                    local_sessions = _owned_sessions()
                     last_sync_ts = time.time()
                     force_resync = False
                     active_eps = {s.endpoint for s in local_sessions.values() if s.endpoint}
@@ -1383,7 +1185,9 @@ def cmd_keepalive_daemon():
                         if stale_ep not in active_eps:
                             _close_ws(stale_ep)
                 except Exception as sync_err:
-                    _emit({"ok": False, "logged_in": True, "ws_connected": bool(ws_map), "warning": f"sync: {sync_err}"})
+                    _close_all_ws()
+                    local_sessions = {}
+                    _emit({"ok": False, "logged_in": True, "ws_connected": False, "warning": f"sync: {sync_err}"})
 
             if not local_sessions:
                 if (now - last_usage_ts) >= 30.0:
@@ -1534,12 +1338,28 @@ def main(argv=None):
 
 def run_cli(argv=None):
     """供独立 CLI 或打包后的 Windows exe (--bridge-cli) 子进程模式统一调用"""
+    command = (sys.argv[1:] if argv is None else argv)[:1]
+    status = 0
     try:
         main(argv)
+    except BridgeAuthError as error:
+        payload = {"ok": False, "error_code": error.code, "error": str(error)}
+        if command == ["wake"]:
+            print("WAKE_ERROR: " + str(error))
+        elif command == ["keepalive_daemon"]:
+            print("KEEPALIVE_JSON:" + json.dumps(payload))
+        else:
+            print(json.dumps(payload))
+        status = 1
+    except SystemExit as error:
+        status = error.code if isinstance(error.code, int) else 1
+    except Exception:
+        print(json.dumps({"ok": False, "error": "The Colab bridge could not complete the command."}))
+        status = 1
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0)
+    os._exit(status)
 
 
 if __name__ == "__main__":

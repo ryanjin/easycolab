@@ -10,11 +10,13 @@ Optimized out of the box for **Google Colab G4 (`NVIDIA RTX PRO 6000 Blackwell` 
 
 ### Authenticated public endpoints
 
-You can redeploy on the same VM. When upgrading from the original release, if ComfyUI is using port `8188`, stop that ComfyUI process before starting the new version. On subsequent restarts on the same VM, EasyColab will try to reconnect to the running ComfyUI canvas. Wake & Deploy generates a management password stored in plaintext in local settings for that server URL. For Gradio or ComfyUI, enter the browser username `easycolab` and copy the password from the desktop connection panel. With a manual notebook, enter a 24–256 character management password (letters, digits, underscores or hyphens) in the hidden prompt, then enter it and the service URL in the desktop client. Restarting the client restores the saved password for that server URL.
+**Wake & Deploy** generates a management password. For a manually started notebook, set a 24–256 character password in the hidden prompt using letters, digits, underscores or hyphens. Enter the **HTTPS service URL and the same password** in the client. When opening Gradio or ComfyUI in a browser, sign in as `easycolab`. OpenAI and Anthropic clients use the separate inference key in the API gateway panel. The Linux runtime uses nginx and OpenSSL to protect both public endpoints. Install both before starting `app.py` directly.
 
-OpenAI and Anthropic clients use the separate inference key in the API gateway panel. Share the management password only with administrators. The Linux runtime uses nginx and OpenSSL for both tunnels, including streaming and WebSockets. Install both before starting `app.py` directly.
+If you manually reuse a VM where an older ComfyUI process occupies port `8188`, stop that process before starting the updated service. Subsequent redeployments on the same VM can reconnect to the existing EasyColab canvas.
 
-Headless Drive mounting can still copy a Google refresh token with Colab and Cloud Platform grants into the VM. Third-party nodes running under the same user can read it. Use trusted nodes and a separate account for evaluation.
+**Existing runtimes and upgrades.** The client can automatically reuse, keep alive or release runtimes created by this installation after verifying ownership with Google. The CU balance and burn rate shown after release cover the whole Google account. Runtimes created by earlier releases lack the new ownership record. These and runtimes from other devices or notebooks may continue to incur charges. Review them in Colab and release them there when your work is complete.
+
+**Drive and generated files.** For persistent models, ComfyUI nodes or generated media, authorize Colab’s native Drive mount in the official notebook. Headless deployment keeps the Google OAuth refresh token on the device. With Drive unmounted, files are stored on the temporary VM disk and the client can still download generated media. If you previously used EasyColab’s rclone Drive mount, save the files you need, revoke the old Google authorization and start a fresh VM. The updated clients stop deployment if they detect legacy EasyColab credentials or a legacy mount.
 
 ---
 
@@ -24,14 +26,15 @@ Headless Drive mounting can still copy a Google refresh token with Colab and Clo
   - **macOS Client** is crafted natively with SwiftUI + AppKit; **Windows & Linux Clients** are built with PySide6 (Qt6 + FFmpeg multimedia pipeline) featuring high-DPI scaling. All include a **4-step interactive onboarding wizard** on first launch with zero-config bridge initialization.
   - Built-in **one-click Chinese / English (`中文 / EN`) live UI toggle** (defaults to Chinese), persisting language preferences automatically without restarting the app.
   - Real-time smooth Catmull-Rom spline telemetry charts for cloud **GPU VRAM / System RAM / Disk Space** (supporting both split and combined overlay modes), paired with official **Compute Unit (CU) balance** and hourly burn-rate tracking.
-  - Built-in **30-minute idle auto-sleep watchdog** and one-click **"Release All Instances"** to prevent forgotten runtimes from draining your CU quota.
+  - Built-in **30-minute idle auto-sleep watchdog** and one-click release of this installation’s runtimes to prevent forgotten runtimes from draining your CU quota.
 
 - **Four Flagship Open-Source Multimodal Engines Out of the Box**
   1. **`MiniMax-H3 (Native BF16)` · 4–15s Cinematic Video with Native Stereo Audio**
      - Supports Text-to-Video+Audio, First-Frame-to-Video, and First/Last-Frame camera transitions, natively generating `24 FPS` video paired with `32 kHz` stereo soundscapes, dialogue, and music.
      - **G4 176 GB Dual-Backbone DDR5 Hot-Standby Acceleration**: Keeps both the `32B Text Encoder` and `33B DiT Backbone` resident in high-speed DDR5 RAM — delivering `0 ms` prompt reuse on consecutive generations and ~`8–12s` PCIe swap-in when editing prompts.
   2. **`ComfyUI Node Studio` · Google Drive Persistence + 4 Curated Ready-to-Run Workflow Packs**
-     - One-click deployment of ComfyUI + ComfyUI-Manager over a free encrypted Cloudflare HTTPS tunnel, with `custom_nodes`, `models`, and `workflows` automatically symlinked and persisted to Google Drive.
+     - One-click deployment of ComfyUI + ComfyUI-Manager over a free encrypted Cloudflare HTTPS tunnel, with automatic linking or syncing of `custom_nodes`, `models`, and `workflows` when Colab’s native Google Drive mount is available.
+     - At startup, EasyColab restores `security_level = normal` for ComfyUI-Manager configurations set to `weak` by earlier releases. Installing nodes over the public canvas follows the Manager’s security settings.
      - Ships with four curated Image-to-Video & First/Last-Frame workflow packs (**Wan2.2 14B**, **MiniMax-H3 Turbo**, **LTX-2.3 (22B)**, and **HunyuanVideo 1.5**) featuring one-click model provisioning.
   3. **`Qwen3.8-27B (UD-Q4_K_M + MTP Speculative Decoding / BF16)` · 100 tok/s Vision Chat & Dual-Protocol API Gateway**
      - Supports up to `256K` context length, deep chain-of-thought reasoning, and multimodal image analysis / prompt reverse-engineering.
@@ -47,7 +50,7 @@ Headless Drive mounting can still copy a Google refresh token with Colab and Clo
 - **Operating System**:
   - **macOS**: macOS 13.0 (Ventura) or later (Apple Silicon / macOS Sonoma & Sequoia recommended)
   - **Windows**: Windows 10 (1903+) or Windows 11 64-bit (x64)
-  - **Linux**: Modern 64-bit desktop distributions (Ubuntu 22.04+ / Debian 12+ / Arch Linux / Fedora, with Python 3.10+ and FFmpeg)
+  - **Linux**: Modern 64-bit desktop distributions (Ubuntu 22.04+ / Debian 12+ / Arch Linux / Fedora, with Python 3.12+ and FFmpeg)
   - **iOS / iPadOS**: iOS 16.0 or later (build & sign locally from open-source `ios_app/` via Xcode, or sideload `.ipa` via AltStore / SideStore / Sideloadly / TrollStore)
   - **Android**: Android 8.0 (API 26) or later (direct signed `.apk` via GitHub Releases, or build from open-source `android_app/`)
 - **Cloud Account**: A Google account subscribed to **Google Colab Pro / Pro+ / Google AI Ultra** with available Compute Units (CU). Free-tier users should follow the *"Run via Official Google Colab Web UI"* section below.
@@ -57,7 +60,7 @@ Headless Drive mounting can still copy a Google refresh token with Colab and Clo
 ### macOS Client
 
 #### Option 1: Build & Run Locally with One Command (Recommended, No Gatekeeper Prompt)
-Requires Xcode Command Line Tools (`xcode-select --install` if not already installed):
+Building requires Xcode Command Line Tools (available via `xcode-select --install`). Headless sign-in and deployment also require Python 3.12 or later.
 
 ```bash
 git clone https://github.com/wy51ai/easycolab.git
@@ -85,7 +88,7 @@ xattr -cr /Applications/EasyColab.app
 3. If Windows SmartScreen displays *"Windows protected your PC"*, click **More info -> Run anyway**.
 
 #### Option 2: Build Standalone `.exe` Locally on Windows
-With 64-bit Python 3.10–3.13 installed, run the one-click build script from the repository root to generate `dist\EasyColab\EasyColab.exe` and `EasyColab-Windows-x64.zip`:
+With 64-bit Python 3.12–3.13 installed, run the one-click build script from the repository root to generate `dist\EasyColab\EasyColab.exe` and `EasyColab-Windows-x64.zip`:
 
 ```bat
 REM Double-click or run in CMD:
@@ -182,17 +185,17 @@ bash android_app/install_release_android.sh
 ### Run via Official Google Colab Web UI (For Colab Free Tier / Browser Users)
 1. Open [Google Colab](https://colab.research.google.com/) and upload `EasyColab_Server.ipynb` from the repository root (or click **Export / Locate `.ipynb` Notebook** inside the app's Onboarding Guide).
 2. In the Colab menu bar, select `Runtime -> Change runtime type`, choose `G4` / `A100` / `L4` GPU, and run the cells in order.
-3. Copy the printed `https://xxxx.gradio.live` URL into the **Server URL** field on the left sidebar of the desktop client and click **Connect**.
+3. Copy the printed `https://xxxx.gradio.live` URL into **Server URL**, enter the management password you set in this notebook and click **Connect**.
 
 ---
 
 ## Privacy & Security Best Practices
 
-1. **Screen-Recording / Screenshot Redaction Mode**: Next to the **Server URL** input in the left sidebar, toggle **Redact / Mask Mode** (eye icon on macOS, **Mask** button on Windows) before recording tutorials, streaming, or sharing screenshots. This masks your temporary `*.gradio.live` and `*.trycloudflare.com` tunnel URLs as well as your Google account email so others cannot access your cloud GPU.
-2. **Inference credentials**. External tools must send the gateway key using Bearer or `x-api-key`.
-3. **Local Credentials & Data Locations**:
-   - The bridge reads the local CLI credentials. Headless Drive mounting also writes a refresh token into the VM’s rclone configuration.
-   - Windows client settings are stored at `%LOCALAPPDATA%\EasyColab\settings.json` (`~/.config/EasyColab/settings.json` on Linux), and generated media is saved by default to `%USERPROFILE%\Videos\EasyColab` (`~/Videos/EasyColab` on Linux, `~/Movies/EasyColab` on macOS).
+- **Device credentials.** The native macOS client stores per-service management passwords, the inference key and the Hugging Face token in Keychain. On upgrade, the client removes the corresponding plaintext preferences after a successful migration. The desktop bridge uses the operating system credential store with `google-colab-cli` 0.8.0. Version 0.7.5 uses a local token file. iOS and iPadOS use Keychain. Android stores encrypted app credentials using a key in Android Keystore.
+- **Windows and Linux.** The Qt client saves management passwords, the inference key and any Hugging Face token in plaintext in the user’s `settings.json`. The location is `%LOCALAPPDATA%\EasyColab\settings.json` on Windows and `~/.config/EasyColab/settings.json` on Linux. Limit access to this file and its backups to trusted users.
+- **Model catalog queries.** When querying your connected EasyColab server, the client sends a Hugging Face token in an HTTPS request header. For authenticated upstream catalog queries, the clients and server send credentials only to `https://huggingface.co`. Third-party mirror fallback is available for anonymous catalog queries.
+- **Desktop media downloads.** Clients accept supported media extensions and save files in the local output directory. They reject filenames that include directory components.
+- **Screen sharing.** The mask control beside the service URL can hide temporary tunnel addresses and the account email. Only administrators need the management password. Give external inference clients the gateway inference key.
 
 ---
 
