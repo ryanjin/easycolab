@@ -313,8 +313,8 @@ class ColabGuideDialog(QDialog):
         c1 = self._make_card(
             tr("1. 绑定 Google 账号（仅首次需要一次）", "1. Bind Google Account (One-time setup)"),
             tr(
-                "点击左侧「绑定」按钮完成官方 OAuth 授权，凭证仅加密保存在你本机的 ~/.config/colab-cli/token.json，自动同步真实 CU 计算单元余额。",
-                "Click 'Bind' in the left sidebar to complete official OAuth login. Credentials stay locally in ~/.config/colab-cli/token.json and sync live CU balance.",
+                "点击左侧「绑定」按钮完成官方 OAuth 授权，授权凭据保存在本机，自动同步真实 CU 计算单元余额。",
+                "Click 'Bind' in the left sidebar to complete official OAuth login. Credentials stay on this device. The client shows your current CU balance.",
             ),
             row1,
         )

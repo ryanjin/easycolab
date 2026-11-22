@@ -90,8 +90,8 @@ extension StudioViewModel {
             let mkProc = Process()
             mkProc.executableURL = URL(fileURLWithPath: sysPy)
             mkProc.arguments = ["-m", "venv", venvDir.path]
-            mkProc.standardOutput = Pipe()
-            mkProc.standardError = Pipe()
+            mkProc.standardOutput = FileHandle.nullDevice
+            mkProc.standardError = FileHandle.nullDevice
             do {
                 try mkProc.run()
                 mkProc.waitUntilExit()
@@ -107,15 +107,15 @@ extension StudioViewModel {
             } else {
                 pipProc.arguments = [
                     "-m", "pip", "install", "-q", "--upgrade", "pip",
-                    "google-colab-cli>=0.7.5",
+                    "google-colab-cli>=0.7.5,<=0.8.0",
                     "google-auth>=2.28.0",
                     "google-auth-oauthlib>=1.2.0",
                     "requests>=2.31.0",
                     "websocket-client>=1.7.0"
                 ]
             }
-            pipProc.standardOutput = Pipe()
-            pipProc.standardError = Pipe()
+            pipProc.standardOutput = FileHandle.nullDevice
+            pipProc.standardError = FileHandle.nullDevice
             do {
                 try pipProc.run()
                 pipProc.waitUntilExit()
@@ -125,20 +125,28 @@ extension StudioViewModel {
             }
         }.value
 
-        if ok, FileManager.default.isExecutableFile(atPath: venvPy) {
-            cachedBridgePythonBin = venvPy
-            liveConsoleLines.append(L(
-                "[本地初始化] Colab 本地连接组件已就绪。",
-                "[Local Init] Local Colab bridge environment is ready."
-            ))
-            return venvPy
-        } else {
+        guard ok else {
             statusMessage = L(
                 "自动安装本地连接依赖失败，请检查网络或执行 pip install -r requirements.txt。",
                 "Failed to install local bridge dependencies. Check your network or run pip install -r requirements.txt."
             )
             return nil
         }
+        let ready = await Task.detached(priority: .userInitiated) {
+            LocalRuntimePaths.canRunBridge(using: venvPy)
+        }.value
+        guard ready else {
+            statusMessage = L("依赖已安装，但本地 Colab 连接程序未能启动。请确认使用的是最新修复版 EasyColab。",
+                              "Dependencies installed, but the local Colab bridge could not start. Check that you are using the updated EasyColab build.")
+            liveConsoleLines.append(statusMessage)
+            return nil
+        }
+        cachedBridgePythonBin = venvPy
+        liveConsoleLines.append(L(
+            "[本地初始化] Colab 本地连接组件已就绪。",
+            "[Local Init] Local Colab bridge environment is ready."
+        ))
+        return venvPy
     }
 
     nonisolated static func extractJSONPayload(from rawOutput: String) -> String {
@@ -158,6 +166,10 @@ extension StudioViewModel {
         guard let pyBin = await ensureBridgePythonBin(installIfMissing: installIfMissing) else {
             return ""
         }
+        return await runBridgeCommand(args, using: pyBin)
+    }
+
+    private func runBridgeCommand(_ args: [String], using pyBin: String) async -> String {
         let script = self.bridgeScript
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -209,28 +221,55 @@ extension StudioViewModel {
     }
 
     func startGoogleOAuthLogin(switchingAccount: Bool = false) async {
-        let out = await runBridgeCommand(["auth_url"], installIfMissing: true)
-        guard let data = out.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let authURLStr = json["auth_url"] as? String,
-              let url = URL(string: authURLStr) else {
-            if !statusMessage.contains("初始化") && !statusMessage.contains("Initializ") && !statusMessage.contains("Python") {
-                statusMessage = L("获取 Google 授权链接失败", "Failed to obtain Google OAuth authorization URL")
+        guard let pyBin = await ensureBridgePythonBin(installIfMissing: true) else { return }
+        let out = await runBridgeCommand(["auth_url"], using: pyBin)
+        let response = try? JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: Any]
+        guard response?["ok"] as? Bool == true, let authURLStr = response?["auth_url"] as? String else {
+            switch response?["error_code"] as? String {
+            case "oauth_config":
+                statusMessage = L("无法读取 Google OAuth 客户端配置。请检查自定义配置文件，或重新安装 EasyColab。",
+                                  "Could not read the Google OAuth client configuration. Check the custom configuration file or reinstall EasyColab.")
+            case "oauth_verifier":
+                statusMessage = L("无法保存登录验证信息。请检查本机 Colab 配置目录的写入权限后重试。",
+                                  "Could not save the sign-in verifier. Check write access to the local Colab configuration directory and try again.")
+            default:
+                statusMessage = L("本地 Colab 连接程序未返回授权链接。请重新点击「绑定」重试。",
+                                  "The local Colab bridge did not return a sign-in link. Click Bind to try again.")
             }
+            liveConsoleLines.append(statusMessage)
+            return
+        }
+        guard let url = URL(string: authURLStr), url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "accounts.google.com", url.user == nil, url.password == nil,
+              url.port == nil || url.port == 443 else {
+            statusMessage = L("授权地址无效。请检查 OAuth 客户端配置中的 Google 授权地址。",
+                              "Invalid sign-in address. Check the Google authorization endpoint in the OAuth client configuration.")
+            liveConsoleLines.append(statusMessage)
+            return
+        }
+        guard NSWorkspace.shared.open(url) else {
+            statusMessage = L("授权链接已生成，但无法打开浏览器。请检查 macOS 默认浏览器设置后重试。",
+                              "The sign-in link is ready, but the browser could not open. Check your default browser in macOS and try again.")
+            liveConsoleLines.append(statusMessage)
             return
         }
         oauthCodeText = ""
         showOAuthCodeInput = true
-        NSWorkspace.shared.open(url)
         statusMessage = switchingAccount
             ? L("已在浏览器打开 Google 账号选择页，请选择新账号授权并粘贴授权码（点取消可保留原账号）。", "Opened Google account chooser in browser. Authorize a new account and paste the code (Cancel keeps current account).")
             : L("已在浏览器打开 Google 授权页，请允许访问后粘贴授权码。", "Opened Google authorization page in browser. Grant access and paste the auth code.")
     }
 
     func logoutGoogleAccount() async {
+        let out = await runBridgeCommand(["auth_logout"], installIfMissing: false)
+        guard let data = out.data(using: .utf8),
+              let result = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data),
+              result.ok == true, result.logged_in == false else {
+            statusMessage = L("退出失败。请确认钥匙串已解锁后再试。", "Sign-out failed. Unlock Keychain and try again.")
+            return
+        }
         stopActiveWakeProcess()
         stopKeepaliveDaemon()
-        _ = await runBridgeCommand(["auth_logout"], installIfMissing: false)
         cliLoggedIn = false
         accountEmail = ""
         showOAuthCodeInput = false
@@ -280,8 +319,8 @@ extension StudioViewModel {
             )
         } else {
             statusMessage = L(
-                "授权码无效: \(decoded.error ?? "请重新获取")",
-                "Invalid authorization code: \(decoded.error ?? "please generate a new code")"
+                "绑定失败：\(decoded.error ?? "请重新获取授权码")",
+                "Sign-in failed: \(decoded.error ?? "please generate a new code")"
             )
         }
     }

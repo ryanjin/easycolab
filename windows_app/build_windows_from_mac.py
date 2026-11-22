@@ -220,7 +220,7 @@ def install_win_amd64_wheels() -> None:
         "PySide6-Essentials>=6.6.0",
         "PySide6-Addons>=6.6.0",
         "requests>=2.31.0",
-        "google-colab-cli>=0.7.5",
+        "google-colab-cli>=0.7.5,<=0.8.0",
         "google-auth>=2.28.0",
         "google-auth-oauthlib>=1.2.0",
         "requests-oauthlib>=1.3.1",

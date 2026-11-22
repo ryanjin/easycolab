@@ -113,7 +113,7 @@ class ViewModelServicesMixin:
             if py.exists():
                 try:
                     chk = subprocess.run(
-                        [str(py), "-c", "import colab_cli, google.auth, websocket"],
+                        [str(py), str(bridge_py), "--help"],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=8,
@@ -146,7 +146,7 @@ class ViewModelServicesMixin:
                     "pip",
                     "install",
                     "-q",
-                    "google-colab-cli>=0.7.5",
+                    "google-colab-cli>=0.7.5,<=0.8.0",
                     "google-auth>=2.28.0",
                     "google-auth-oauthlib>=1.2.0",
                     "requests>=2.31.0",
@@ -336,11 +336,15 @@ class ViewModelServicesMixin:
     def logout_google_account(self) -> None:
         def worker() -> None:
             try:
-                self._run_bridge_json(["auth_logout"], install_if_missing=False, timeout=20)
+                result = self._run_bridge_json(["auth_logout"], install_if_missing=False, timeout=75)
             except Exception:
-                pass
+                result = {}
 
             def apply_ui() -> None:
+                if result.get("ok") is not True or result.get("logged_in") is not False:
+                    self._set_status_and_log(tr("退出失败，请确认系统凭据库已解锁后重试。",
+                                                "Sign-out failed. Unlock the system credential store and retry."))
+                    return
                 self.cli_logged_in = False
                 self.account_email = ""
                 self.official_cu_balance = None

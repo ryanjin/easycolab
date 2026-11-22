@@ -1168,27 +1168,26 @@ enum LocalRuntimePaths {
     }
 
     static func findReadyBridgePython() -> String? {
-        let fm = FileManager.default
         var candidates: [String] = []
         if let repo = repoRootIfPresent {
             candidates.append(repo.appendingPathComponent(".venv/bin/python").path)
             candidates.append(repo.appendingPathComponent("venv/bin/python").path)
         }
         candidates.append(managedVenvDir.appendingPathComponent("bin/python").path)
-        for py in candidates where fm.isExecutableFile(atPath: py) {
-            let check = Process()
-            check.executableURL = URL(fileURLWithPath: py)
-            check.arguments = ["-c", "import colab_cli, google.auth, websocket"]
-            check.standardOutput = Pipe()
-            check.standardError = Pipe()
-            if (try? check.run()) != nil {
-                check.waitUntilExit()
-                if check.terminationStatus == 0 {
-                    return py
-                }
-            }
-        }
-        return nil
+        return candidates.first(where: canRunBridge(using:))
+    }
+
+    // Load the same bridge entry point the Bind button will invoke, without starting OAuth.
+    static func canRunBridge(using python: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: python) else { return false }
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: python)
+        check.arguments = [resolveBundledOrRepoFile("colab_bridge.py"), "--help"]
+        check.standardOutput = FileHandle.nullDevice
+        check.standardError = FileHandle.nullDevice
+        guard (try? check.run()) != nil else { return false }
+        check.waitUntilExit()
+        return check.terminationStatus == 0
     }
 
     static func findSystemPython3() -> String? {

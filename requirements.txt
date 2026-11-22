@@ -2,7 +2,7 @@
 # Note: EasyColab.app automatically bootstraps these in ~/Library/Application Support/EasyColab/venv on first login.
 # Cloud GPU inference dependencies (PyTorch, DiffSynth-Studio, llama.cpp, ComfyUI) are installed automatically on Colab.
 
-google-colab-cli>=0.7.5
+google-colab-cli>=0.7.5,<=0.8.0
 google-auth>=2.28.0
 google-auth-oauthlib>=1.2.0
 requests>=2.31.0

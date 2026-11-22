@@ -198,7 +198,7 @@ bash android_app/install_release_android.sh
 
 ## 隐私与安全建议
 
-- **本机凭据。** macOS 原生客户端把各服务地址的管理密码、推理密钥和 Hugging Face 令牌保存在「钥匙串」中。升级时，旧设置中的对应条目会在成功迁移后移除。桌面桥接用的 Google OAuth 凭据单独保存在 `~/.config/colab-cli/token.json`。iOS / iPadOS 使用钥匙串，Android 使用 Android Keystore 中的密钥加密保存应用凭据。
+- **本机凭据。** macOS 原生客户端把各服务地址的管理密码、推理密钥和 Hugging Face 令牌保存在「钥匙串」中。升级时，旧设置中的对应条目会在成功迁移后移除。桌面桥接使用的 `google-colab-cli` 0.8.0 将 Google OAuth 凭据保存在操作系统的凭据库中。0.7.5 使用仅当前用户可读写的令牌文件。iOS / iPadOS 使用钥匙串，Android 使用 Android Keystore 中的密钥加密保存应用凭据。
 - **Windows 与 Linux。** Qt 客户端的管理密码、推理密钥以及填写的 Hugging Face 令牌以明文保存在用户的 `settings.json` 中。Windows 路径为 `%LOCALAPPDATA%\EasyColab\settings.json`，Linux 路径为 `~/.config/EasyColab/settings.json`。请把备份和访问权限限定在可信用户范围内。
 - **模型目录查询。** 客户端查询已连接的 EasyColab 服务时，将 Hugging Face 令牌放入 HTTPS 请求头。向上游查询需要令牌的模型时，客户端和服务端只向 `https://huggingface.co` 提交认证。第三方镜像仅用于匿名目录查询。
 - **桌面媒体下载。** 客户端只接受允许的媒体扩展名，并把文件保存在本地输出目录中。服务端返回的带目录成分的文件名会被拒绝。

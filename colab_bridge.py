@@ -33,7 +33,7 @@ from importlib import resources
 import requests
 import websocket
 from websocket import ABNF
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -92,10 +92,13 @@ def _sync_macos_system_proxies_to_env():
 _sync_macos_system_proxies_to_env()
 os.environ.setdefault("COLAB_CLI_REQUEST_TIMEOUT", "75")
 
-from colab_cli.auth import PUBLIC_SCOPES, TOKEN_CONFIG_PATH, REMOTE_REDIRECT_URI
+from colab_cli import auth as colab_auth
+from colab_cli.auth import PUBLIC_SCOPES, REMOTE_REDIRECT_URI
 from colab_cli.common import state
 from colab_cli.client import (
     Accelerator,
+    Client,
+    Prod,
     Variant,
     Shape,
     resolve_assign_shape,
@@ -132,37 +135,87 @@ def _write_private_file(path, contents: str):
             os.unlink(temporary)
 
 
-def _has_valid_token() -> bool:
-    if not os.path.exists(TOKEN_CONFIG_PATH):
-        return False
+# 0.8 moved the CLI's OAuth token to the system credential store. Both
+# versions use the same installed-app OAuth client and copy/paste flow.
+USES_KEYRING = hasattr(colab_auth, "LEGACY_TOKEN_PATH")
+TOKEN_CONFIG_PATH = colab_auth.LEGACY_TOKEN_PATH if USES_KEYRING else colab_auth.TOKEN_CONFIG_PATH
+
+
+class BridgeAuthError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _remove_if_present(path):
     try:
-        if os.name == "posix" and os.stat(TOKEN_CONFIG_PATH).st_mode & 0o077:
-            os.chmod(TOKEN_CONFIG_PATH, 0o600)
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
-        if creds and creds.valid:
-            return True
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _save_credentials(creds, *, remove_legacy=False):
+    try:
+        if USES_KEYRING:
+            colab_auth._save_token_to_keyring(creds.to_json())
+            if remove_legacy:
+                _remove_if_present(TOKEN_CONFIG_PATH)
+        else:
             _write_private_file(TOKEN_CONFIG_PATH, creds.to_json())
-            return True
-    except Exception:
-        return False
-    return False
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not save Google credentials. Unlock the system credential store and check access to the Colab CLI settings folder.") from error
+
+
+def _load_credentials():
+    """Load existing credentials without running the CLI's interactive login."""
+    try:
+        stored = colab_auth._get_token_from_keyring() if USES_KEYRING else None
+        if stored:
+            creds = Credentials.from_authorized_user_info(json.loads(stored), PUBLIC_SCOPES)
+        else:
+            if not os.path.isfile(TOKEN_CONFIG_PATH):
+                return None
+            if os.name == "posix" and os.stat(TOKEN_CONFIG_PATH).st_mode & 0o077:
+                os.chmod(TOKEN_CONFIG_PATH, 0o600)
+            creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not read Google credentials. Unlock the system credential store or bind the account again.") from error
+
+    refreshed = False
+    if not creds.valid and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as error:
+            raise BridgeAuthError("oauth_refresh", "Could not refresh Google authorization. Check the network and bind the account again if authorization expired.") from error
+        refreshed = True
+    if not creds.valid:
+        return None
+    migrate = USES_KEYRING and not stored
+    if refreshed or migrate:
+        _save_credentials(creds, remove_legacy=migrate)
+    return creds
+
+
+def _authenticated_credentials():
+    creds = _load_credentials()
+    if creds is not None:
+        # state.client otherwise asks the upstream CLI to authenticate again.
+        # It may read terminal input if the store is locked or unavailable.
+        state._client = Client(Prod(), AuthorizedSession(creds))
+    return creds
+
+
+def _has_valid_token() -> bool:
+    return _authenticated_credentials() is not None
 
 
 PKCE_VERIFIER_PATH = os.path.expanduser("~/.config/colab-cli/pkce_verifier.txt")
 ACCOUNT_PROFILE_CACHE_PATH = os.path.expanduser("~/.config/colab-cli/account_profile.json")
 
 
-def _get_account_email() -> str:
-    """获取当前绑定 Google 账号邮箱（按 refresh_token 指纹本地缓存，避免重复请求）"""
-    if not os.path.exists(TOKEN_CONFIG_PATH):
-        return ""
+def _get_account_email(creds) -> str:
+    """Cache profile metadata by token fingerprint."""
     try:
-        creds = Credentials.from_authorized_user_file(TOKEN_CONFIG_PATH, PUBLIC_SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            _write_private_file(TOKEN_CONFIG_PATH, creds.to_json())
         token = creds.refresh_token or creds.token
         tok_fp = hashlib.sha256(token.encode()).hexdigest() if token else ""
         if tok_fp and os.path.exists(ACCOUNT_PROFILE_CACHE_PATH):
@@ -189,48 +242,62 @@ def _get_account_email() -> str:
     return ""
 
 
+def _oauth_flow():
+    try:
+        flow = InstalledAppFlow.from_client_config(_load_client_config(), PUBLIC_SCOPES, autogenerate_code_verifier=True)
+        flow.redirect_uri = REMOTE_REDIRECT_URI
+        return flow
+    except Exception as error:
+        raise BridgeAuthError("oauth_config", "Could not load the Google OAuth client configuration. Check the custom OAuth JSON or reinstall the Colab CLI dependency.") from error
+
+
 def cmd_auth_url():
-    client_config = _load_client_config()
-    flow = InstalledAppFlow.from_client_config(client_config, PUBLIC_SCOPES)
-    flow.redirect_uri = REMOTE_REDIRECT_URI
-    # 显式传入 select_account consent，强制弹出 Google 多账号选择器以支持自由切换账号
-    auth_url, _ = flow.authorization_url(prompt="select_account consent", token_usage="remote")
-    if getattr(flow, "code_verifier", None):
+    flow = _oauth_flow()
+    try:
+        auth_url, _ = flow.authorization_url(prompt="select_account consent", token_usage="remote")
+    except Exception as error:
+        raise BridgeAuthError("oauth_config", "Could not build the Google authorization link. Check the OAuth client configuration.") from error
+    try:
         _write_private_file(PKCE_VERIFIER_PATH, flow.code_verifier)
+    except (OSError, TypeError) as error:
+        raise BridgeAuthError("oauth_verifier", "Could not save the sign-in verifier. Check write access to the Colab CLI settings folder.") from error
     print(json.dumps({"ok": True, "auth_url": auth_url}))
 
 
 def cmd_auth_code(code: str):
+    flow = _oauth_flow()
     try:
-        client_config = _load_client_config()
-        flow = InstalledAppFlow.from_client_config(client_config, PUBLIC_SCOPES)
-        flow.redirect_uri = REMOTE_REDIRECT_URI
-        if os.path.exists(PKCE_VERIFIER_PATH):
-            with open(PKCE_VERIFIER_PATH, "r", encoding="utf-8") as f:
-                flow.code_verifier = f.read().strip()
+        with open(PKCE_VERIFIER_PATH, encoding="utf-8") as stream:
+            flow.code_verifier = stream.read().strip()
+        if not flow.code_verifier:
+            raise ValueError("empty verifier")
+    except (OSError, ValueError) as error:
+        raise BridgeAuthError("oauth_verifier", "Start Google account binding again to generate a new sign-in verifier.") from error
+    try:
         flow.fetch_token(code=code.strip())
         creds = flow.credentials
-        state._client = None
-        for p in (ACCOUNT_PROFILE_CACHE_PATH, PKCE_VERIFIER_PATH):
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        _write_private_file(TOKEN_CONFIG_PATH, creds.to_json())
-        return cmd_auth_status()
-    except Exception as e:
-        print(json.dumps({"ok": False, "logged_in": False, "error": str(e)}))
+    except Exception as error:
+        raise BridgeAuthError("oauth_exchange", "Google authorization failed. Check the network and use a fresh authorization code from the most recent sign-in link.") from error
+
+    _save_credentials(creds, remove_legacy=True)
+    state._client = None
+    _remove_if_present(ACCOUNT_PROFILE_CACHE_PATH)
+    _remove_if_present(PKCE_VERIFIER_PATH)
+    cmd_auth_status()
 
 
 def cmd_auth_logout():
+    try:
+        if USES_KEYRING and colab_auth._get_token_from_keyring() is not None:
+            colab_auth._run_with_timeout(
+                colab_auth.keyring.delete_password, colab_auth.KEYRING_SERVICE_NAME,
+                colab_auth.KEYRING_USERNAME, timeout=colab_auth.KEYRING_TIMEOUT_SECONDS,
+            )
+        for path in (TOKEN_CONFIG_PATH, PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
+            _remove_if_present(path)
+    except Exception as error:
+        raise BridgeAuthError("oauth_store", "Could not remove Google credentials. Unlock the system credential store and retry signing out.") from error
     state._client = None
-    for p in (TOKEN_CONFIG_PATH, PKCE_VERIFIER_PATH, ACCOUNT_PROFILE_CACHE_PATH):
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
     print(json.dumps({"ok": True, "logged_in": False, "email": ""}))
 
 
@@ -318,7 +385,8 @@ def _owned_sessions():
 
 
 def cmd_auth_status():
-    if not _has_valid_token():
+    creds = _authenticated_credentials()
+    if creds is None:
         print(json.dumps({"ok": True, "logged_in": False}))
         return
 
@@ -335,7 +403,7 @@ def cmd_auth_status():
                 "shape": a.machine_shape.name,
             })
 
-        email = _get_account_email()
+        email = _get_account_email(creds)
         print(json.dumps({
             "ok": True,
             "logged_in": True,
@@ -349,7 +417,7 @@ def cmd_auth_status():
         print(json.dumps({
             "ok": False,
             "logged_in": True,
-            "email": _get_account_email(),
+            "email": _get_account_email(creds),
             "error": str(e),
         }))
 
@@ -1270,12 +1338,28 @@ def main(argv=None):
 
 def run_cli(argv=None):
     """供独立 CLI 或打包后的 Windows exe (--bridge-cli) 子进程模式统一调用"""
+    command = (sys.argv[1:] if argv is None else argv)[:1]
+    status = 0
     try:
         main(argv)
+    except BridgeAuthError as error:
+        payload = {"ok": False, "error_code": error.code, "error": str(error)}
+        if command == ["wake"]:
+            print("WAKE_ERROR: " + str(error))
+        elif command == ["keepalive_daemon"]:
+            print("KEEPALIVE_JSON:" + json.dumps(payload))
+        else:
+            print(json.dumps(payload))
+        status = 1
+    except SystemExit as error:
+        status = error.code if isinstance(error.code, int) else 1
+    except Exception:
+        print(json.dumps({"ok": False, "error": "The Colab bridge could not complete the command."}))
+        status = 1
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0)
+    os._exit(status)
 
 
 if __name__ == "__main__":
