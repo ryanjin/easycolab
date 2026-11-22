@@ -20,9 +20,7 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 # 内置服务端与桥接资源，支持将 EasyColab.app 独立拖入 /Applications 开箱即用
 for res_file in "VERSION" "app.py" "runtime_auth.py" "colab_bridge.py" "EasyColab_Server.ipynb" "requirements.txt"; do
-    if [ -f "${PROJECT_ROOT}/${res_file}" ]; then
-        cp -f "${PROJECT_ROOT}/${res_file}" "${RESOURCES_DIR}/${res_file}"
-    fi
+    cp -f "${PROJECT_ROOT}/${res_file}" "${RESOURCES_DIR}/${res_file}"
 done
 
 # 1. 生成 Info.plist
@@ -63,11 +61,12 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
 EOF
 
 # 2. 生成 EasyColab 应用图标 (AppIcon.icns)
-ICONSET_DIR="/tmp/EasyColabIcon.iconset"
-rm -rf "${ICONSET_DIR}"
-mkdir -p "${ICONSET_DIR}"
+ICON_TMP="$(mktemp -d "${TMPDIR:-/tmp}/easycolab-icon.XXXXXXXX")"
+trap 'rm -rf -- "$ICON_TMP"' EXIT
+ICONSET_DIR="$ICON_TMP/EasyColabIcon.iconset"
+mkdir "$ICONSET_DIR"
 
-swift - << 'SWIFT_ICON'
+swift - "$ICONSET_DIR" << 'SWIFT_ICON'
 import AppKit
 
 func drawIcon(_ size: Int, _ path: String) {
@@ -120,13 +119,12 @@ func drawIcon(_ size: Int, _ path: String) {
     try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: path))
 }
 for size in [16, 32, 128, 256, 512] {
-    drawIcon(size, "/tmp/EasyColabIcon.iconset/icon_\(size)x\(size).png")
-    drawIcon(size * 2, "/tmp/EasyColabIcon.iconset/icon_\(size)x\(size)@2x.png")
+    drawIcon(size, "\(CommandLine.arguments[1])/icon_\(size)x\(size).png")
+    drawIcon(size * 2, "\(CommandLine.arguments[1])/icon_\(size)x\(size)@2x.png")
 }
 SWIFT_ICON
 
 iconutil -c icns "${ICONSET_DIR}" -o "${RESOURCES_DIR}/AppIcon.icns"
-rm -rf "${ICONSET_DIR}"
 
 # 3. 编译原生 SwiftUI macOS 通用可执行程序 (兼容 macOS 13.0+ Ventura/Sonoma/Sequoia/Tahoe/27 及 Apple Silicon + Intel)
 echo "Compiling SwiftUI native macOS Universal app (${APP_NAME} v${APP_VERSION}, target macOS 13.0+)..."
@@ -163,7 +161,6 @@ else
 fi
 
 # 4. 本地签名并打包 EasyColab-macOS.zip 发行压缩包
-xattr -cr "${BUNDLE_DIR}" 2>/dev/null || true
 codesign --force --deep --sign - "${BUNDLE_DIR}"
 touch "${BUNDLE_DIR}"
 

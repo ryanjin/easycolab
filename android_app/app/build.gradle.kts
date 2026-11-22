@@ -81,7 +81,7 @@ val generatedColabAssetsDir = layout.buildDirectory.dir("generated/colabAssets")
 
 val syncColabServerAssets by tasks.registering(Copy::class) {
     from(repoRoot) {
-        include("VERSION", "app.py", "EasyColab_Server.ipynb")
+        include("VERSION", "app.py", "runtime_auth.py", "mobile_bootstrap.py", "EasyColab_Server.ipynb")
     }
     into(generatedColabAssetsDir)
 }

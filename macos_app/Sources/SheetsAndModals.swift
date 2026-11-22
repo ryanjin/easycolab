@@ -574,10 +574,10 @@ struct ColabGuideSheet: View {
 
         guideInfoCard(
             number: "2",
-            title: L("开启自动休眠 + 用完点「释放全部实例」立省 CU 额度", "Idle Auto-Sleep + 'Release All Instances' Saves Compute Units"),
+            title: L("自动休眠与释放 EasyColab 实例", "Auto-Sleep and Releasing EasyColab Runtimes"),
             detail: L(
-                "Colab 按 GPU 在线时长消耗计算单元（CU）：\n• 左侧「算力额度与自动休眠」默认开启 30 分钟闲置看门狗，长时间离开会自动销毁虚拟机防止忘关机。\n• 当天创作结束时，建议直接点击左侧红色的「释放全部实例」按钮，云端 GPU 立即销毁、计费瞬间归零！",
-                "Colab bills Compute Units (CU) while a GPU VM is online:\n• 'Compute Quota & Auto-Sleep' enables a 30-minute idle watchdog by default to auto-terminate forgotten runtimes.\n• When done for the day, click the red 'Release All Instances' button on the left to destroy cloud VMs and stop CU burn immediately!"
+                "Colab 按 GPU 在线时长消耗计算单元（CU）：\n• 左侧「算力额度与自动休眠」默认开启 30 分钟闲置看门狗，长时间离开会自动销毁虚拟机防止忘关机。\n• 创作结束后，点击「释放 EasyColab 实例」可释放此安装创建的实例。账号总用量请在 Colab 中查看。",
+                "Colab bills Compute Units (CU) while a GPU VM is online:\n• 'Compute Quota & Auto-Sleep' enables a 30-minute idle watchdog by default to auto-terminate forgotten runtimes.\n• When finished, click 'Release EasyColab Runtimes' to release runtimes created by this installation. Check Colab for total account usage."
             ),
             palette: palette
         ) { EmptyView() }

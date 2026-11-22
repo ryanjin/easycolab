@@ -12,14 +12,23 @@ struct EasyColabApp: App {
     @ObservedObject private var i18n = LanguageManager.shared
 
     init() {
-        Self.migrateLegacyDefaultsIfNeeded()
+        let legacyDomains = ["app.aevix.studio.macos", "com.colab.aistudio.macos", "com.minimax.h3studio.macos"]
+        if let domain = Bundle.main.bundleIdentifier {
+            MacCredentials.migratePreferences(in: domain, defaults: .standard)
+        }
+        for domain in legacyDomains {
+            if let legacy = UserDefaults(suiteName: domain) {
+                MacCredentials.migratePreferences(in: domain, defaults: legacy)
+            }
+        }
+        Self.migrateLegacyDefaultsIfNeeded(from: legacyDomains)
         SleekScrollBarInstaller.install()
     }
 
-    private static func migrateLegacyDefaultsIfNeeded() {
+    private static func migrateLegacyDefaultsIfNeeded(from legacyDomains: [String]) {
         let std = UserDefaults.standard
         guard !std.bool(forKey: "migratedToEasyColabSuite") else { return }
-        for suiteName in ["app.aevix.studio.macos", "com.colab.aistudio.macos", "com.minimax.h3studio.macos"] {
+        for suiteName in legacyDomains {
             if let legacy = UserDefaults(suiteName: suiteName) {
                 if std.string(forKey: "colabServerURL") == nil,
                    let url = legacy.string(forKey: "colabServerURL"), !url.isEmpty {
@@ -28,10 +37,6 @@ struct EasyColabApp: App {
                 if std.double(forKey: "totalBudgetCU") == 0 {
                     let cu = legacy.double(forKey: "totalBudgetCU")
                     if cu > 0 { std.set(cu, forKey: "totalBudgetCU") }
-                }
-                if std.string(forKey: "apiAccessKey") == nil,
-                   let key = legacy.string(forKey: "apiAccessKey"), !key.isEmpty {
-                    std.set(key, forKey: "apiAccessKey")
                 }
                 if std.object(forKey: "apiKeyEnabled") == nil,
                    legacy.object(forKey: "apiKeyEnabled") != nil {

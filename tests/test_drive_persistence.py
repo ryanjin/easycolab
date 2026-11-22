@@ -24,7 +24,6 @@ def _load_app_drive_helpers(tmp_root: str):
 
     wanted_funcs = {
         "_is_drive_mounted_live",
-        "_has_rclone_drive_remote",
         "_refresh_drive_mount_state",
         "_flush_drive_file",
         "_persist_generated_output_to_drive",
@@ -47,40 +46,51 @@ def _load_app_drive_helpers(tmp_root: str):
         "DRIVE_MOUNTED": False,
         "MODEL_BASE_ROOT": os.path.join(tmp_root, "models"),
         "DEFAULT_OUTPUT_DIR": os.path.join(tmp_root, "outputs"),
-        "_RCLONE_DRIVE_PROBE_CACHE": {"mtime": -1.0, "ts": 0.0, "ok": False},
     }
     exec(compile(mod, APP_PY_PATH, "exec"), ns)
     return ns
 
 
 class ColabBridgeDriveMountTest(unittest.TestCase):
-    def test_build_rclone_conf_rejects_public_adc_without_quota_project(self):
+    def test_wake_uploads_only_server_sources_and_single_use_management_password(self):
+        fake_session = mock.Mock(accelerator="G4", kernel_id="own-kernel", endpoint="owned")
+        uploaded = []
+        def inspect_upload(source, destination):
+            if destination.startswith("content/.easycolab-management-"):
+                with open(source, encoding="ascii") as f:
+                    self.assertEqual(f.read(), "x" * 30)
+            uploaded.append(destination)
+
+        with (mock.patch("colab_bridge._has_valid_token", return_value=True),
+              mock.patch("colab_bridge._owned_sessions", return_value={"owned": fake_session}),
+              mock.patch("colab_bridge._wait_for_runtime_ready", return_value=True),
+              mock.patch("colab_bridge.ContentsClient") as contents,
+              mock.patch("colab_bridge.ColabRuntime") as runtime,
+              mock.patch.object(colab_bridge.state, "_history", mock.Mock()),
+              mock.patch.dict(os.environ, {"EASYCOLAB_ADMIN_PASSWORD": "x" * 30}),
+              redirect_stdout(io.StringIO())):
+            contents.return_value.upload.side_effect = inspect_upload
+            runtime.return_value.execute_code.return_value = []
+            colab_bridge.cmd_wake("G4", APP_PY_PATH)
+        self.assertEqual(uploaded[:2], ["content/app.py", "content/runtime_auth.py"])
+        self.assertEqual(len(uploaded), 3)
+        self.assertTrue(uploaded[2].startswith("content/.easycolab-management-"))
+        code = runtime.return_value.execute_code.call_args.args[0]
+        self.assertNotIn("x" * 30, code)
+        self.assertNotIn("refresh_token", code)
+        self.assertNotIn('"rclone", "mount"', code)
+
+    @unittest.skipIf(os.name == "nt", "POSIX modes")
+    def test_credential_writes_replace_existing_permissive_files_privately(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tok_file = os.path.join(tmp, "token.json")
-            adc_payload = {
-                "token": "ya29.test",
-                "refresh_token": "1//refresh",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com",
-                "client_secret": "d-secret",
-                "scopes": list(colab_bridge.PUBLIC_SCOPES),
-                "expiry": "2099-01-01T00:00:00Z",
-            }
-            with open(tok_file, "w", encoding="utf-8") as f:
-                json.dump(adc_payload, f)
-
-            self.assertEqual(colab_bridge._build_rclone_drive_conf(tok_file), "")
-
-            custom_payload = {
-                **adc_payload,
-                "client_id": "1234567890-customapp.apps.googleusercontent.com",
-            }
-            with open(tok_file, "w", encoding="utf-8") as f:
-                json.dump(custom_payload, f)
-
-            conf = colab_bridge._build_rclone_drive_conf(tok_file)
-            self.assertIn("[easycolab_gdrive]", conf)
-            self.assertIn("1234567890-customapp.apps.googleusercontent.com", conf)
+            path = os.path.join(tmp, "oauth.json")
+            with open(path, "w") as stream:
+                stream.write("old")
+            os.chmod(path, 0o644)
+            colab_bridge._write_private_file(path, "replacement")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with open(path) as stream:
+                self.assertEqual(stream.read(), "replacement")
 
 
 class AppDrivePersistenceHelpersTest(unittest.TestCase):
@@ -113,51 +123,17 @@ class AppDrivePersistenceHelpersTest(unittest.TestCase):
             ):
                 self.assertTrue(ns["_is_drive_mounted_live"]())
 
-    def test_rclone_remote_rejects_broken_adc_client_and_syncs_when_valid(self):
+    def test_unmounted_outputs_stay_local_without_external_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
             ns = _load_app_drive_helpers(tmp)
-            rc_file = os.path.join(tmp, "rclone.conf")
-            with open(rc_file, "w", encoding="utf-8") as f:
-                f.write("[easycolab_gdrive]\ntype = drive\nclient_id = 764086051850-abc.apps.googleusercontent.com\n")
-
-            with (
-                mock.patch("os.path.expanduser", return_value=rc_file),
-                mock.patch("shutil.which", return_value="/usr/local/bin/rclone"),
-            ):
-                self.assertFalse(ns["_has_rclone_drive_remote"]())
-
-            # Write a custom OAuth client config and verify rclone probe + output copy
-            with open(rc_file, "w", encoding="utf-8") as f:
-                f.write("[easycolab_gdrive]\ntype = drive\nclient_id = 998877-custom.apps.googleusercontent.com\n")
-
-            local_img = os.path.join(tmp, "outputs", "sample.png")
-            os.makedirs(os.path.dirname(local_img), exist_ok=True)
-            with open(local_img, "wb") as wf:
-                wf.write(b"PNGDATA" * 100)
-
-            ran_cmds = []
-
-            def fake_run(cmd, **kwargs):
-                ran_cmds.append(cmd)
-                return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
-
-            with (
-                mock.patch("os.path.expanduser", return_value=rc_file),
-                mock.patch("shutil.which", return_value="/usr/local/bin/rclone"),
-                mock.patch("subprocess.run", side_effect=fake_run),
-                mock.patch.dict(ns, {"_is_drive_mounted_live": lambda: False}),
-            ):
-                self.assertTrue(ns["_has_rclone_drive_remote"]())
-                saved = ns["_persist_generated_output_to_drive"](local_img)
-                self.assertEqual(saved, local_img)
-
-            self.assertTrue(
-                any(
-                    cmd[:2] == ["rclone", "copy"]
-                    and "easycolab_gdrive:EasyColab_Drive/EasyColab_Outputs" in cmd
-                    for cmd in ran_cmds
-                )
-            )
+            path = os.path.join(tmp, "output.png")
+            with open(path, "wb") as stream:
+                stream.write(b"image")
+            with (mock.patch.dict(ns, {"_is_drive_mounted_live": lambda: False}),
+                  mock.patch("subprocess.run") as run):
+                self.assertEqual(ns["_persist_generated_output_to_drive"](path), path)
+            run.assert_not_called()
+            self.assertTrue(os.path.isfile(path))
 
     def test_refresh_drive_mount_state_upgrades_output_dir_and_flushes(self):
         with tempfile.TemporaryDirectory() as tmp:

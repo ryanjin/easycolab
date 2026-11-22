@@ -7,6 +7,8 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
+import json
 import threading
 import time
 import unittest
@@ -149,7 +151,7 @@ class ColabBridgeKeepaliveTest(unittest.TestCase):
 
         with mock.patch("colab_bridge.requests.get", return_value=fake_resp) as m_get, \
              mock.patch("colab_bridge.requests.delete") as m_del, \
-             mock.patch.object(colab_bridge.state.store, "add"):
+             mock.patch("colab_bridge._remember_kernel"):
             kid = colab_bridge._resolve_or_start_remote_kernel(sess)
             self.assertEqual(kid, "kid-main")
             m_del.assert_not_called()
@@ -186,9 +188,9 @@ class ColabBridgeKeepaliveTest(unittest.TestCase):
         code = (
             "import time, unittest.mock as m, colab_bridge;"
             "m.patch('colab_bridge._has_valid_token', return_value=True).start();"
-            "m.patch('colab_bridge._sync_and_adopt_sessions', return_value=({}, [])).start();"
+            "m.patch('colab_bridge._owned_sessions', return_value={}).start();"
             "info = type('I', (), {'paid_compute_units_balance': 100.0, 'consumption_rate_hourly': 0.0, 'assignments_count': 0})();"
-            "m.patch.object(colab_bridge.state, '_client', type('C', (), {'get_consumption_user_info': lambda self: info})());"
+            "m.patch.object(colab_bridge.state, '_client', type('C', (), {'get_consumption_user_info': lambda self: info})()).start();"
             "colab_bridge.cmd_keepalive_daemon()"
         )
         proc = subprocess.Popen(
@@ -211,127 +213,89 @@ class ColabBridgeKeepaliveTest(unittest.TestCase):
         self.assertLess(time.time() - t0, 2.0)
 
 
-def _fake_assignment(endpoint: str, accel, shape=None, token: str = "tok_x", url: str = "https://8080-gpu.prod.r.colab.dev"):
-    from datetime import datetime, timedelta, timezone
-    from colab_cli.client import Shape
-    sh = shape if shape is not None else Shape.STANDARD
-    proxy = mock.MagicMock()
-    proxy.token = token
-    proxy.url = url
-    proxy.expires_at.return_value = datetime.now(timezone.utc) + timedelta(seconds=3600)
-    a = mock.MagicMock()
-    a.endpoint = endpoint
-    a.accelerator = accel
-    a.machine_shape = sh
-    a.runtime_proxy_info = proxy
-    return a
+def _fake_assignment(endpoint="gpu-owned"):
+    from colab_cli.client import Assignment
+    return Assignment(endpoint=endpoint, runtimeProxyInfo={
+        "token": "proxy-token", "url": "https://8080-gpu.prod.r.colab.dev", "tokenExpiresInSeconds": 3600
+    })
+
+
+def _listed(endpoint):
+    return mock.Mock(endpoint=endpoint, accelerator=colab_bridge.Accelerator.G4)
 
 
 class HighTierAllocationReconciliationTest(unittest.TestCase):
-    def test_allocate_recovers_background_g4_when_post_assign_times_out(self):
-        import requests as req_pkg
-        from colab_cli.client import Accelerator, Shape
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.enterContext(mock.patch.object(colab_bridge, "SESSION_DB", os.path.join(tmp.name, "sessions.sqlite3")))
+        self.client = mock.MagicMock()
+        self.enterContext(mock.patch.object(colab_bridge.state, "_client", self.client))
+        self.enterContext(mock.patch("colab_bridge._has_valid_token", return_value=True))
+        self.enterContext(mock.patch("colab_bridge.time.sleep"))
+        self.out = self.enterContext(mock.patch("sys.stdout", new_callable=io.StringIO))
 
-        bg_g4 = _fake_assignment("gpu-g4-s-use5a1-orphan1", Accelerator.G4, Shape.STANDARD, token="tok_g4")
-        fake_client = mock.MagicMock()
-        fake_client.assign.side_effect = req_pkg.exceptions.ReadTimeout("Gateway read timed out")
-        fake_client.list_assignments.return_value = [bg_g4]
-
-        with mock.patch.object(colab_bridge.state, "_client", fake_client), \
-             mock.patch.object(colab_bridge.state.store, "add") as m_add:
-            sess = colab_bridge._allocate_fresh_session("easycolab", "G4")
-            self.assertEqual(sess.endpoint, "gpu-g4-s-use5a1-orphan1")
-            self.assertEqual(sess.accelerator, "G4")
-            self.assertEqual(sess.token, "tok_g4")
-            self.assertEqual(fake_client.assign.call_count, 1)
-            m_add.assert_called_once()
+    def test_allocate_recovers_lost_reply_by_retrying_the_same_private_notebook(self):
+        import requests
+        self.client.assign.side_effect = [requests.exceptions.ReadTimeout(), _fake_assignment()]
+        session = colab_bridge._allocate_fresh_session("G4")
+        self.assertEqual(session.endpoint, "gpu-owned")
+        notebook_ids = [c.args[0] for c in self.client.assign.call_args_list]
+        self.assertEqual(notebook_ids, [colab_bridge._notebook_id(colab_bridge.Accelerator.G4)] * 2)
+        self.client.list_assignments.assert_not_called()
+        self.client.unassign.assert_not_called()
 
     def test_allocate_switches_shape_on_503_and_reports_clear_capacity_message(self):
-        from colab_cli.client import Accelerator, ColabRequestError, Shape
+        from colab_cli.client import ColabRequestError, Shape
+        error = ColabRequestError("unavailable", None, mock.MagicMock(status_code=503))
+        self.client.assign.side_effect = error
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            colab_bridge._allocate_fresh_session("H100")
+        self.assertEqual([c.kwargs["shape"] for c in self.client.assign.call_args_list],
+                         [None, Shape.HIGH_RAM, None])
+        self.client.unassign.assert_not_called()
 
-        resp_503 = mock.MagicMock(status_code=503, reason="Service Unavailable")
-        err_503 = ColabRequestError("503 Service Unavailable", None, resp_503)
-
-        fake_client = mock.MagicMock()
-        fake_client.assign.side_effect = [err_503, err_503, err_503]
-        fake_client.list_assignments.return_value = []
-
-        with mock.patch.object(colab_bridge.state, "_client", fake_client), \
-             mock.patch("colab_bridge.time.sleep"):
-            with self.assertRaises(RuntimeError) as ctx:
-                colab_bridge._allocate_fresh_session("easycolab", "H100")
-
-        self.assertIn("算力池库存不足", str(ctx.exception))
-        self.assertIn("HTTP 503", str(ctx.exception))
-        shapes_tried = [call.kwargs.get("shape") for call in fake_client.assign.call_args_list]
-        self.assertEqual(shapes_tried, [None, Shape.HIGH_RAM, None])
-
-    def test_cmd_wake_adopts_untracked_g4_and_unassigns_old_a100(self):
-        from colab_cli.client import Accelerator, Shape
-
-        s_a100 = SessionState(
-            name="easycolab",
-            token="tok_a100",
-            url="https://8080-a100.prod.r.colab.dev",
-            endpoint="gpu-a100-hm-1",
-            accelerator="A100",
-        )
-        a_a100 = _fake_assignment("gpu-a100-hm-1", Accelerator.A100, Shape.HIGH_RAM, token="tok_a100")
-        a_g4_orphan = _fake_assignment("gpu-g4-s-orphan", Accelerator.G4, Shape.STANDARD, token="tok_g4")
-
-        fake_client = mock.MagicMock()
-        fake_client.list_assignments.return_value = [a_g4_orphan]
-        stop_after_reconcile = RuntimeError("STOP_BEFORE_UPLOAD")
-
-        with mock.patch("colab_bridge._has_valid_token", return_value=True), \
-             mock.patch.dict(os.environ, {"EASYCOLAB_ADMIN_PASSWORD": "pw_" + "x" * 28}), \
-             mock.patch("colab_bridge._safe_sync_sessions", return_value=({"easycolab": s_a100}, [a_a100, a_g4_orphan])), \
-             mock.patch("colab_bridge._wait_for_runtime_ready", return_value=True), \
-             mock.patch("colab_bridge._allocate_fresh_session") as m_alloc, \
-             mock.patch("colab_bridge.ContentsClient", side_effect=stop_after_reconcile), \
-             mock.patch.object(colab_bridge.state, "_client", fake_client), \
-             mock.patch.object(colab_bridge.state.store, "add") as m_add:
-            out_buf = io.StringIO()
-            with mock.patch.object(sys, "stdout", out_buf):
+    def test_empty_registry_never_adopts_shared_or_cloud_sessions(self):
+        self.client.list_assignments.return_value = [_listed("other-notebook")]
+        with mock.patch.object(colab_bridge.state, "sync_sessions", side_effect=AssertionError):
+            colab_bridge.cmd_stop_all()
+            colab_bridge.cmd_keepalive()
+            with mock.patch.dict(os.environ, {"EASYCOLAB_ADMIN_PASSWORD": "x" * 30}):
+                self.client.assign.side_effect = colab_bridge.TooManyAssignmentsError()
                 colab_bridge.cmd_wake("G4", APP_PY_PATH)
+        self.assertIn("HTTP 412", self.out.getvalue())
+        self.client._get_assignment.assert_not_called()
+        self.client.list_assignments.assert_not_called()
+        self.client.unassign.assert_not_called()
+        self.client._issue_request.assert_not_called()
 
-        m_alloc.assert_not_called()
-        fake_client.unassign.assert_called_once_with("gpu-a100-hm-1")
-        saved_sess = m_add.call_args[0][0]
-        self.assertEqual(saved_sess.endpoint, "gpu-g4-s-orphan")
-        self.assertEqual(saved_sess.accelerator, "G4")
+    def test_only_google_lookup_by_a_persisted_notebook_id_authorizes_stop(self):
+        gpu = colab_bridge.Accelerator.G4
+        notebook_id = colab_bridge._notebook_id(gpu)
+        self.client._get_assignment.return_value = _fake_assignment()
+        self.client.list_assignments.side_effect = [[_listed("gpu-owned"), _listed("foreign")], [_listed("foreign")]]
+        self.client.get_consumption_user_info.return_value = mock.Mock(
+            consumption_rate_hourly=1.0, paid_compute_units_balance=10.0, assignments_count=1)
+        with mock.patch("colab_bridge.ColabRuntime") as runtime:
+            colab_bridge.cmd_stop_all()
+        self.client._get_assignment.assert_called_once_with(notebook_id, colab_bridge.Variant.GPU, gpu, None)
+        self.client.unassign.assert_called_once_with("gpu-owned")
+        self.assertEqual(runtime.call_count, 1)
+        self.assertEqual(json.loads(self.out.getvalue())["stopped_count"], 1)
 
-    def test_cmd_wake_unassigns_all_orphans_before_allocating_g4(self):
-        from colab_cli.client import Accelerator, Shape
-
-        s_a100 = SessionState(
-            name="easycolab",
-            token="tok_a100",
-            url="https://8080-a100.prod.r.colab.dev",
-            endpoint="gpu-a100-hm-1",
-            accelerator="A100",
-        )
-        a_a100 = _fake_assignment("gpu-a100-hm-1", Accelerator.A100, Shape.HIGH_RAM)
-        a_l4_orphan = _fake_assignment("gpu-l4-s-orphan", Accelerator.L4, Shape.STANDARD)
-
-        fake_client = mock.MagicMock()
-        fake_client.list_assignments.return_value = []
-        stop_at_alloc = RuntimeError("REACHED_FRESH_ALLOC")
-
-        with mock.patch("colab_bridge._has_valid_token", return_value=True), \
-             mock.patch.dict(os.environ, {"EASYCOLAB_ADMIN_PASSWORD": "pw_" + "x" * 28}), \
-             mock.patch("colab_bridge._safe_sync_sessions", return_value=({"easycolab": s_a100}, [a_a100, a_l4_orphan])), \
-             mock.patch("colab_bridge._allocate_fresh_session", side_effect=stop_at_alloc) as m_alloc, \
-             mock.patch.object(colab_bridge.state, "prune_session"), \
-             mock.patch.object(colab_bridge.state, "_client", fake_client):
-            out_buf = io.StringIO()
-            with mock.patch.object(sys, "stdout", out_buf):
-                colab_bridge.cmd_wake("G4", APP_PY_PATH)
-
-        m_alloc.assert_called_once_with("easycolab", "G4")
-        unassigned = [c.args[0] for c in fake_client.unassign.call_args_list]
-        self.assertEqual(set(unassigned), {"gpu-a100-hm-1", "gpu-l4-s-orphan"})
-        self.assertEqual(len(unassigned), 2)
+    def test_stale_session_does_not_control_a_recycled_endpoint(self):
+        self.client.assign.return_value = _fake_assignment()
+        previous = colab_bridge._allocate_fresh_session("G4")
+        previous.kernel_id = "first-kernel"
+        colab_bridge._remember_kernel(previous)
+        self.client._get_assignment.return_value = None  # unallocated or another account
+        self.client.list_assignments.return_value = [_listed(previous.endpoint)]
+        self.assertEqual(colab_bridge._owned_sessions(), {})
+        self.client._get_assignment.return_value = _fake_assignment("replacement")
+        self.client.list_assignments.return_value = [_listed("replacement")]
+        replacement = colab_bridge._owned_sessions()["replacement"]
+        colab_bridge._remember_kernel(previous)
+        self.assertIsNone(colab_bridge._owned_sessions()[replacement.endpoint].kernel_id)
 
 
 def _load_minimax_h3_image_helpers(tmp_root: str):

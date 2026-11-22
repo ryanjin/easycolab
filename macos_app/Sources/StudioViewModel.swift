@@ -6,26 +6,6 @@ import ObjectiveC.runtime
 
 // MARK: - 核心视图模型 (ViewModel)
 
-final class SameOriginAdminRedirect: NSObject, URLSessionTaskDelegate {
-    static func permits(_ target: URL?, from origin: URL?) -> Bool {
-        guard let target, let origin, let host = origin.host, !host.isEmpty,
-              target.scheme?.lowercased() == "https", origin.scheme?.lowercased() == "https",
-              target.user == nil, target.password == nil, origin.user == nil, origin.password == nil else { return false }
-        return target.host?.lowercased() == host.lowercased() && (target.port ?? 443) == (origin.port ?? 443)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        guard let original = task.originalRequest, Self.permits(request.url, from: original.url) else {
-            completionHandler(nil)
-            return
-        }
-        var redirected = request
-        redirected.setValue(original.value(forHTTPHeaderField: "Authorization"), forHTTPHeaderField: "Authorization")
-        completionHandler(redirected)
-    }
-}
-
 @MainActor
 class StudioViewModel: ObservableObject {
     var cachedBridgePythonBin: String? = nil
@@ -57,14 +37,17 @@ class StudioViewModel: ObservableObject {
     private static func savedAdminPassword(for address: String) -> String {
         let normalized = normalizeServerURL(address)
         guard !normalized.isEmpty else { return "" }
-        let passwords = UserDefaults.standard.dictionary(forKey: "adminPasswordsByURL") as? [String: String]
-        return passwords?[normalized] ?? passwords?[address] ?? ""
+        return (try? MacCredentials.read(MacCredentials.adminAccount(normalized))) ?? ""
     }
+
+    private var loadingAdminPassword = false
 
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
         didSet {
             if Self.normalizeServerURL(oldValue) != Self.normalizeServerURL(colabServerURL) {
+                loadingAdminPassword = true
                 adminPassword = Self.savedAdminPassword(for: colabServerURL)
+                loadingAdminPassword = false
                 remoteApiKeySynced = false
                 remoteIdleSynced = false
                 remoteContextSynced = false
@@ -79,18 +62,19 @@ class StudioViewModel: ObservableObject {
         for: UserDefaults.standard.string(forKey: "colabServerURL") ?? ""
     ) {
         didSet {
-            let key = normalizedBaseURL
-            guard !key.isEmpty, adminPassword != Self.savedAdminPassword(for: key) else { return }
-            var passwords = UserDefaults.standard.dictionary(forKey: "adminPasswordsByURL") as? [String: String] ?? [:]
-            passwords[key] = adminPassword.isEmpty ? nil : adminPassword
-            if colabServerURL != key {
-                passwords.removeValue(forKey: colabServerURL)
-            }
-            UserDefaults.standard.set(passwords, forKey: "adminPasswordsByURL")
+            guard !loadingAdminPassword, !normalizedBaseURL.isEmpty, adminPassword != oldValue else { return }
+            persistCredential(adminPassword, for: MacCredentials.adminAccount(normalizedBaseURL))
         }
     }
-    @Published var hfToken: String = UserDefaults.standard.string(forKey: "hfToken") ?? "" {
-        didSet { UserDefaults.standard.set(hfToken, forKey: "hfToken") }
+    @Published var hfToken: String = (try? MacCredentials.read("hfToken")) ?? "" {
+        didSet { if hfToken != oldValue { persistCredential(hfToken, for: "hfToken") } }
+    }
+
+    private func persistCredential(_ value: String, for account: String) {
+        do { try MacCredentials.save(value, for: account) }
+        catch {
+            statusMessage = L("钥匙串写入失败，本次修改只在当前窗口生效。", "Keychain write failed. This change applies only to the current window.")
+        }
     }
 
     // 默认初始文案（支持中英文双向无损切换）
@@ -334,15 +318,18 @@ class StudioViewModel: ObservableObject {
 
     let apiKeyEnabled = true
     @Published var apiAccessKey: String = {
-        if let saved = UserDefaults.standard.string(forKey: "apiAccessKey"), !saved.isEmpty {
-            return saved
+        do {
+            if let saved = try MacCredentials.read("apiAccessKey") { return saved }
+            let generated = "sk-colab-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            try MacCredentials.save(generated, for: "apiAccessKey")
+            return generated
+        } catch {
+            // Do not rotate a previously stored key when its Keychain is inaccessible.
+            return ""
         }
-        let generated = "sk-colab-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20).lowercased()
-        UserDefaults.standard.set(generated, forKey: "apiAccessKey")
-        return generated
     }() {
         didSet {
-            UserDefaults.standard.set(apiAccessKey, forKey: "apiAccessKey")
+            if apiAccessKey != oldValue { persistCredential(apiAccessKey, for: "apiAccessKey") }
         }
     }
     @Published var apiRequestCount: Int = 0
@@ -1565,11 +1552,7 @@ class StudioViewModel: ObservableObject {
         do {
             let (tempURL, response) = try await adminSession.download(for: adminRequest(remoteURL))
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            let destURL = localSaveDir.appendingPathComponent(filename)
-            if FileManager.default.fileExists(atPath: destURL.path) {
-                try FileManager.default.removeItem(at: destURL)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: destURL)
+            let destURL = try LocalMediaDownload.save(tempURL, filename: filename, in: localSaveDir)
             if let el = elapsedSeconds, el > 0 {
                 mediaElapsedMap[destURL.lastPathComponent] = el
             }
@@ -1604,8 +1587,8 @@ class StudioViewModel: ObservableObject {
         stopActiveWakeProcess()
         stopKeepaliveDaemon()
         statusMessage = L(
-            "正在释放云端 Colab 实例并同步账户计费状态...",
-            "Terminating cloud Colab instances & syncing billing status..."
+            "正在释放 EasyColab 实例并查询账号用量...",
+            "Releasing EasyColab runtimes and checking account usage..."
         )
         let base = normalizedBaseURL
         if !base.isEmpty, let url = URL(string: "\(base)/minimax_api/disconnect"), var req = try? adminRequest(url) {
@@ -1619,17 +1602,16 @@ class StudioViewModel: ObservableObject {
             if let data = out.data(using: .utf8),
                let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) {
                 officialCUBalance = decoded.paid_balance ?? officialCUBalance
-                officialBurnRate = decoded.burn_rate_hourly ?? 0.0
-                activeVMCount = decoded.active_assignments ?? 0
-                statusMessage = decoded.message ?? L(
-                    "已彻底释放全部云端实例，计费速率归零。",
-                    "All cloud Colab instances terminated. Billing rate is now 0 CU/h."
-                )
+                if let rate = decoded.burn_rate_hourly { officialBurnRate = rate }
+                if let count = decoded.active_assignments { activeVMCount = count }
+                statusMessage = localizeServerText(decoded.message ?? decoded.error ?? L("请在 Colab 中确认实例状态。", "Check runtime status in Colab."))
+            } else {
+                statusMessage = L("无法确认实例是否已释放，请在 Colab 中查看。", "Could not confirm release. Check runtime status in Colab.")
             }
         } else {
             statusMessage = L(
-                "已发送释放指令，Colab 实例已停止计费。",
-                "Release command sent. Colab runtime billing stopped."
+                "请在 Colab 中确认当前实例的释放和计费状态。",
+                "Check the current runtime and its billing status in Colab."
             )
         }
 

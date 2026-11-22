@@ -77,14 +77,14 @@ extension IOSStudioViewModel {
             comps?.queryItems = [
                 URLQueryItem(name: "category", value: cat),
                 URLQueryItem(name: "limit", value: "12"),
-                URLQueryItem(name: "hf_token", value: hfToken),
                 URLQueryItem(name: "force_refresh", value: forceRefresh ? "true" : "false"),
                 URLQueryItem(name: "search_query", value: sq)
             ]
             if let url = comps?.url {
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 12
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                req.setValue(hfToken, forHTTPHeaderField: "X-HuggingFace-Token")
+                if let (data, resp) = try? await studioSession.data(for: adminRequest(req)),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let dec = try? JSONDecoder().decode(HFTrendingAPIResponse.self, from: data),
                    let models = dec.models, !models.isEmpty {
@@ -126,7 +126,7 @@ extension IOSStudioViewModel {
 
         for qpath in queryPaths {
             var rawArr: [[String: Any]]? = nil
-            for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+            for host in tok.isEmpty ? ["https://huggingface.co", "https://hf-mirror.com"] : ["https://huggingface.co"] {
                 guard let url = URL(string: "\(host)\(qpath)") else { continue }
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 10
@@ -134,7 +134,7 @@ extension IOSStudioViewModel {
                 if !tok.isEmpty {
                     req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
                 }
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                if let (data, resp) = try? await studioSession.data(for: req),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
                     rawArr = arr
@@ -219,13 +219,13 @@ extension IOSStudioViewModel {
         if isConnected, !base.isEmpty {
             var comps = URLComponents(string: "\(base)/minimax_api/hf_model_detail")
             comps?.queryItems = [
-                URLQueryItem(name: "repo_id", value: cleanId),
-                URLQueryItem(name: "hf_token", value: tok)
+                URLQueryItem(name: "repo_id", value: cleanId)
             ]
             if let url = comps?.url {
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 14
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                req.setValue(tok, forHTTPHeaderField: "X-HuggingFace-Token")
+                if let (data, resp) = try? await studioSession.data(for: adminRequest(req)),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let dec = try? JSONDecoder().decode(HFModelDetailInfo.self, from: data),
                    dec.ok == true {
@@ -236,7 +236,7 @@ extension IOSStudioViewModel {
         }
 
         var metaObj: [String: Any]? = nil
-        for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+        for host in tok.isEmpty ? ["https://huggingface.co", "https://hf-mirror.com"] : ["https://huggingface.co"] {
             guard let url = URL(string: "\(host)/api/models/\(cleanId)?blobs=true") else { continue }
             var req = URLRequest(url: url)
             req.timeoutInterval = 12
@@ -244,7 +244,7 @@ extension IOSStudioViewModel {
             if !tok.isEmpty {
                 req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
             }
-            if let (data, resp) = try? await URLSession.shared.data(for: req),
+            if let (data, resp) = try? await studioSession.data(for: req),
                (resp as? HTTPURLResponse)?.statusCode == 200,
                let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                 metaObj = dict
@@ -350,7 +350,7 @@ extension IOSStudioViewModel {
         let sizing = analyzeHFModelSizing(meta, repoId: rid, isGGUF: isGGUF, fallbackStorageGb: fallbackGb)
 
         var readmeExcerpt = ""
-        for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+        for host in tok.isEmpty ? ["https://huggingface.co", "https://hf-mirror.com"] : ["https://huggingface.co"] {
             guard let rURL = URL(string: "\(host)/\(rid)/raw/main/README.md") else { continue }
             var rReq = URLRequest(url: rURL)
             rReq.timeoutInterval = 6
@@ -358,7 +358,7 @@ extension IOSStudioViewModel {
             if !tok.isEmpty {
                 rReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
             }
-            if let (rData, rResp) = try? await URLSession.shared.data(for: rReq),
+            if let (rData, rResp) = try? await studioSession.data(for: rReq),
                (rResp as? HTTPURLResponse)?.statusCode == 200,
                let rawMd = String(data: rData.prefix(32768), encoding: .utf8) {
                 readmeExcerpt = cleanHFReadmeExcerpt(rawMd)
@@ -428,7 +428,7 @@ extension IOSStudioViewModel {
                     "hf_token": hfToken,
                     "auto_download": autoDownload
                 ])
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await studioSession.data(for: adminRequest(req))
                 if (resp as? HTTPURLResponse)?.statusCode == 200,
                    let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
                     applyStatusResponse(decoded)
@@ -522,7 +522,7 @@ extension IOSStudioViewModel {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: ["model_id": spec.id, "delete_files": false])
-            if let (data, _) = try? await URLSession.shared.data(for: req),
+            if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
                let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
                 applyStatusResponse(dec)
             }
@@ -545,7 +545,7 @@ extension IOSStudioViewModel {
         do {
             var req = URLRequest(url: url)
             req.timeoutInterval = isGenerating ? 28 : 20
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await studioSession.data(for: adminRequest(req))
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else {
                 consecutiveStatusFailures += 1
@@ -625,7 +625,7 @@ extension IOSStudioViewModel {
                 "hf_token": hfToken,
                 "auto_download": false
             ])
-            if let (rData, _) = try? await URLSession.shared.data(for: regReq),
+            if let (rData, _) = try? await studioSession.data(for: adminRequest(regReq)),
                let rDec = try? JSONDecoder().decode(ColabStatusResponse.self, from: rData),
                let regDto = rDec.registered_model {
                 applyStatusResponse(rDec)
@@ -647,12 +647,12 @@ extension IOSStudioViewModel {
                 "include_pattern": activeModelSpec.isCustom ? activeModelSpec.includePattern : "",
                 "custom_name": activeModelSpec.isCustom ? activeModelSpec.nameZh : ""
             ])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             applyStatusResponse(try JSONDecoder().decode(ColabStatusResponse.self, from: data))
             while isDownloadingWeights {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if let sURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
-                   let (sData, _) = try? await URLSession.shared.data(from: sURL),
+                   let (sData, _) = try? await studioSession.data(for: adminRequest(URLRequest(url: sURL))),
                    let sDec = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
                     applyStatusResponse(sDec)
                     if let msg = sDec.task_message, !msg.isEmpty { statusMessage = localizeServerText(msg) }
@@ -694,12 +694,12 @@ extension IOSStudioViewModel {
                 "include_pattern": activeModelSpec.isCustom ? activeModelSpec.includePattern : "",
                 "custom_name": activeModelSpec.isCustom ? activeModelSpec.nameZh : ""
             ])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             applyStatusResponse(try JSONDecoder().decode(ColabStatusResponse.self, from: data))
             while isLoadingModel {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if let sURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
-                   let (sData, _) = try? await URLSession.shared.data(from: sURL),
+                   let (sData, _) = try? await studioSession.data(for: adminRequest(URLRequest(url: sURL))),
                    let sDec = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
                     applyStatusResponse(sDec)
                     if let msg = sDec.task_message, !msg.isEmpty { statusMessage = localizeServerText(msg) }
@@ -727,7 +727,7 @@ extension IOSStudioViewModel {
             req.timeoutInterval = 20
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: ["model_id": modelId])
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await studioSession.data(for: adminRequest(req))
             if (resp as? HTTPURLResponse)?.statusCode == 200,
                let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
                 applyStatusResponse(decoded)
@@ -744,7 +744,7 @@ extension IOSStudioViewModel {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["idle_timeout_minutes": minutes])
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             applyStatusResponse(dec)
         }
@@ -757,7 +757,7 @@ extension IOSStudioViewModel {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["context_length": contextLengthTokens])
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             applyStatusResponse(dec)
         }
@@ -776,7 +776,7 @@ extension IOSStudioViewModel {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["api_key": key])
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             remoteApiKeySynced = true
             applyStatusResponse(dec)
@@ -808,7 +808,7 @@ extension IOSStudioViewModel {
                 "unload_existing": comfyUnloadOthersOnStart,
                 "force_restart": forceRestart
             ])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             applyStatusResponse(try JSONDecoder().decode(ColabStatusResponse.self, from: data))
             for _ in 0..<180 {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -833,7 +833,7 @@ extension IOSStudioViewModel {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 35
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             applyStatusResponse(dec)
         }
@@ -846,7 +846,7 @@ extension IOSStudioViewModel {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 90
-        if let (data, _) = try? await URLSession.shared.data(for: req),
+        if let (data, _) = try? await studioSession.data(for: adminRequest(req)),
            let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
             applyStatusResponse(dec)
             showToast(L("已同步至 Google Drive", "Synced to Google Drive"))
@@ -872,7 +872,7 @@ extension IOSStudioViewModel {
                 "auto_start": true,
                 "hf_token": hfToken
             ])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             applyStatusResponse(try JSONDecoder().decode(ColabStatusResponse.self, from: data))
             for _ in 0..<600 {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -903,7 +903,7 @@ extension IOSStudioViewModel {
                 "subfolder": comfyWeightSubfolder,
                 "hf_token": hfToken
             ])
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, _) = try await studioSession.data(for: adminRequest(req))
             applyStatusResponse(try JSONDecoder().decode(ColabStatusResponse.self, from: data))
             while comfyDownloadingWeight {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1012,15 +1012,20 @@ extension IOSStudioViewModel {
     }
 
     func downloadMediaToLocal(from remoteURL: URL, filename: String, elapsedSeconds: Double?) async {
+        guard !filename.hasPrefix("."), !filename.contains("/"), !filename.contains("\\"), !filename.utf8.contains(0),
+              ["mp4", "webm", "mov", "png", "jpg", "jpeg", "webp", "gif"].contains((filename as NSString).pathExtension.lowercased()) else { return }
         let alreadyExists = FileManager.default.fileExists(atPath: localSaveDir.appendingPathComponent(filename).path)
         do {
-            let (tempURL, resp) = try await URLSession.shared.download(from: remoteURL)
+            let (tempURL, resp) = try await studioSession.download(for: adminRequest(URLRequest(url: remoteURL)))
             guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
             let destURL = localSaveDir.appendingPathComponent(filename)
             if FileManager.default.fileExists(atPath: destURL.path) {
-                try? FileManager.default.removeItem(at: destURL)
+                let attributes = try destURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard attributes.isRegularFile == true, attributes.isSymbolicLink != true else { return }
+                _ = try FileManager.default.replaceItemAt(destURL, withItemAt: tempURL)
+            } else {
+                try FileManager.default.moveItem(at: tempURL, to: destURL)
             }
-            try FileManager.default.moveItem(at: tempURL, to: destURL)
             if let el = elapsedSeconds, el > 0 {
                 mediaElapsedMap[filename] = el
             }

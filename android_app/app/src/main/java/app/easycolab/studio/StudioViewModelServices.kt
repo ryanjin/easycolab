@@ -125,6 +125,12 @@ internal fun StudioViewModel.normalizeHFRepoId(raw: String): String {
     return if (parts.size >= 2) "${parts[0]}/${parts[1]}" else s
 }
 
+private fun hfMetadataHosts(token: String) = if (token.isEmpty()) {
+    listOf("https://huggingface.co", "https://hf-mirror.com")
+} else {
+    listOf("https://huggingface.co")
+}
+
 fun StudioViewModel.fetchTrendingHFModels(
     category: String = trendingHFCategory,
     forceRefresh: Boolean = false,
@@ -141,10 +147,9 @@ fun StudioViewModel.fetchTrendingHFModels(
             val parsed = mutableListOf<HFTrendingModelItem>()
             if (isConnected && base.isNotEmpty()) {
                 try {
-                    val encTok = URLEncoder.encode(tok, "UTF-8")
                     val encSq = URLEncoder.encode(sq, "UTF-8")
-                    val url = "$base/minimax_api/hf_trending?category=$cat&limit=12&hf_token=$encTok&force_refresh=$forceRefresh&search_query=$encSq"
-                    val req = Request.Builder().url(url).get().build()
+                    val url = "$base/minimax_api/hf_trending?category=$cat&limit=12&force_refresh=$forceRefresh&search_query=$encSq"
+                    val req = Request.Builder().url(url).header("X-HuggingFace-Token", tok).get().build()
                     apiClient.newCall(req).execute().use { resp ->
                         if (resp.isSuccessful) {
                             val root = JSONObject(resp.body?.string() ?: "{}")
@@ -201,7 +206,7 @@ fun StudioViewModel.fetchTrendingHFModels(
             val seen = mutableSetOf<String>()
             for (qpath in qpaths) {
                 var rawArr: JSONArray? = null
-                for (host in listOf("https://huggingface.co", "https://hf-mirror.com")) {
+                for (host in hfMetadataHosts(tok)) {
                     try {
                         val rb = Request.Builder()
                             .url("$host$qpath")
@@ -210,7 +215,7 @@ fun StudioViewModel.fetchTrendingHFModels(
                         if (tok.isNotEmpty()) {
                             rb.header("Authorization", "Bearer $tok")
                         }
-                        apiClient.newCall(rb.build()).execute().use { resp ->
+                        publicModelClient.newCall(rb.build()).execute().use { resp ->
                             if (resp.isSuccessful) {
                                 val bodyStr = resp.body?.string() ?: ""
                                 if (bodyStr.trim().startsWith("[")) {
@@ -284,14 +289,14 @@ fun StudioViewModel.fetchHFModelDetail(repoIdRaw: String) {
         val tok = hfToken.trim()
         val detail = withContext(Dispatchers.IO) {
             var meta: JSONObject? = null
-            for (host in listOf("https://huggingface.co", "https://hf-mirror.com")) {
+            for (host in hfMetadataHosts(tok)) {
                 try {
                     val rb = Request.Builder()
                         .url("$host/api/models/$cleanId?blobs=true")
                         .header("User-Agent", "EasyColab-Android/2.0")
                         .get()
                     if (tok.isNotEmpty()) rb.header("Authorization", "Bearer $tok")
-                    apiClient.newCall(rb.build()).execute().use { resp ->
+                    publicModelClient.newCall(rb.build()).execute().use { resp ->
                         if (resp.isSuccessful) {
                             meta = JSONObject(resp.body?.string() ?: "{}")
                         }
@@ -350,11 +355,11 @@ fun StudioViewModel.fetchHFModelDetail(repoIdRaw: String) {
                 }
             }
             var readme = ""
-            for (host in listOf("https://huggingface.co", "https://hf-mirror.com")) {
+            for (host in hfMetadataHosts(tok)) {
                 try {
                     val rb = Request.Builder().url("$host/$rid/raw/main/README.md").get()
                     if (tok.isNotEmpty()) rb.header("Authorization", "Bearer $tok")
-                    apiClient.newCall(rb.build()).execute().use { resp ->
+                    publicModelClient.newCall(rb.build()).execute().use { resp ->
                         if (resp.isSuccessful) {
                             var raw = (resp.body?.string() ?: "").take(24000)
                             if (raw.startsWith("---")) {

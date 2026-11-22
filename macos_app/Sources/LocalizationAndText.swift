@@ -77,7 +77,7 @@ func localizeServerText(_ text: String) -> String {
         "Google Drive 云盘自动持久化": "Google Drive Auto-Persistence",
         "实例本地高速存储": "Instance Local NVMe Storage",
         "就绪：默认已选 G4 (RTX PRO 6000 · 96GB)，可在左侧一键唤醒实例并部署模型。": "Ready: G4 (RTX PRO 6000 · 96GB) selected by default. Wake & deploy from the left sidebar.",
-        "已彻底释放全部云端实例，计费速率归零。": "All cloud Colab instances terminated. Billing rate is now 0 CU/h.",
+        "部分 EasyColab 实例释放失败，请重试。": "Some EasyColab runtimes could not be released. Try again.",
         "正在初始化 ComfyUI 环境与 Google Drive 持久化目录...": "Initializing ComfyUI environment & Google Drive persistence folders...",
         "正在释放现有常驻模型显存，为 ComfyUI 腾出完整 96GB 空间...": "Releasing resident models from VRAM to free full 96GB for ComfyUI...",
         "正在从 Google Drive 恢复历史持久化的 ComfyUI 节点、模型与工作流...": "Restoring persisted ComfyUI nodes, models & workflows from Google Drive...",
@@ -114,6 +114,9 @@ func localizeServerText(_ text: String) -> String {
 
     var s = localizeModelFileDesc(text)
     let replacements: [(String, String)] = [
+        ("已释放 ", "Released "),
+        (" 个 EasyColab 实例。当前账号计费速率: ", " EasyColab runtimes. Current account usage is "),
+        (" CU/小时", " CU/hour"),
         ("已无缝接管在线 ComfyUI 画布", "Connected to active ComfyUI canvas"),
         ("ComfyUI 进程已退出", "ComfyUI process exited"),
         ("，可点击重新启动", "; click to restart"),

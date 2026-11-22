@@ -839,17 +839,18 @@ extension StudioViewModel {
         defer { isLoadingTrendingHF = false }
 
         let base = normalizedBaseURL
+        let tok = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if isConnected, !base.isEmpty {
             var comps = URLComponents(string: "\(base)/minimax_api/hf_trending")
             comps?.queryItems = [
                 URLQueryItem(name: "category", value: cat),
                 URLQueryItem(name: "limit", value: "12"),
-                URLQueryItem(name: "hf_token", value: hfToken),
                 URLQueryItem(name: "force_refresh", value: forceRefresh ? "true" : "false"),
                 URLQueryItem(name: "search_query", value: sq)
             ]
             if let url = comps?.url, var req = try? adminRequest(url) {
                 req.timeoutInterval = 12
+                if !tok.isEmpty { req.setValue(tok, forHTTPHeaderField: "X-HuggingFace-Token") }
                 if let (data, resp) = try? await adminSession.data(for: req),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let dec = try? JSONDecoder().decode(HFTrendingAPIResponse.self, from: data),
@@ -886,21 +887,15 @@ extension StudioViewModel {
             queryPaths = ["/api/models?sort=trendingScore&direction=-1&limit=22\(searchQS)\(expandQS)"]
         }
 
-        let tok = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
         var parsed: [HFTrendingModelItem] = []
         var seen = Set<String>()
 
         for qpath in queryPaths {
             var rawArr: [[String: Any]]? = nil
-            for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+            for host in HFCatalogRequests.hosts(token: tok) {
                 guard let url = URL(string: "\(host)\(qpath)") else { continue }
-                var req = URLRequest(url: url)
-                req.timeoutInterval = 10
-                req.setValue("EasyColab-macOS/2.0", forHTTPHeaderField: "User-Agent")
-                if !tok.isEmpty {
-                    req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-                }
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                let req = HFCatalogRequests.request(url, token: tok, timeout: 10)
+                if let (data, resp) = try? await HFCatalogRequests.session.data(for: req),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
                     rawArr = arr
@@ -980,11 +975,11 @@ extension StudioViewModel {
         if isConnected, !base.isEmpty {
             var comps = URLComponents(string: "\(base)/minimax_api/hf_model_detail")
             comps?.queryItems = [
-                URLQueryItem(name: "repo_id", value: cleanId),
-                URLQueryItem(name: "hf_token", value: tok)
+                URLQueryItem(name: "repo_id", value: cleanId)
             ]
             if let url = comps?.url, var req = try? adminRequest(url) {
                 req.timeoutInterval = 14
+                if !tok.isEmpty { req.setValue(tok, forHTTPHeaderField: "X-HuggingFace-Token") }
                 if let (data, resp) = try? await adminSession.data(for: req),
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    var dec = try? JSONDecoder().decode(HFModelDetailInfo.self, from: data),
@@ -998,15 +993,10 @@ extension StudioViewModel {
 
         // Offline / direct HuggingFace API fallback
         var metaObj: [String: Any]? = nil
-        for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+        for host in HFCatalogRequests.hosts(token: tok) {
             guard let url = URL(string: "\(host)/api/models/\(cleanId)?blobs=true") else { continue }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 12
-            req.setValue("EasyColab-macOS/2.0", forHTTPHeaderField: "User-Agent")
-            if !tok.isEmpty {
-                req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-            }
-            if let (data, resp) = try? await URLSession.shared.data(for: req),
+            let req = HFCatalogRequests.request(url, token: tok, timeout: 12)
+            if let (data, resp) = try? await HFCatalogRequests.session.data(for: req),
                (resp as? HTTPURLResponse)?.statusCode == 200,
                let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                 metaObj = dict
@@ -1112,15 +1102,10 @@ extension StudioViewModel {
         let sizing = analyzeHFModelSizing(meta, repoId: rid, isGGUF: isGGUF, fallbackStorageGb: fallbackGb)
 
         var readmeExcerpt = ""
-        for host in ["https://huggingface.co", "https://hf-mirror.com"] {
+        for host in HFCatalogRequests.hosts(token: tok) {
             guard let rURL = URL(string: "\(host)/\(rid)/raw/main/README.md") else { continue }
-            var rReq = URLRequest(url: rURL)
-            rReq.timeoutInterval = 6
-            rReq.setValue("EasyColab-macOS/2.0", forHTTPHeaderField: "User-Agent")
-            if !tok.isEmpty {
-                rReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
-            }
-            if let (rData, rResp) = try? await URLSession.shared.data(for: rReq),
+            let rReq = HFCatalogRequests.request(rURL, token: tok, timeout: 6)
+            if let (rData, rResp) = try? await HFCatalogRequests.session.data(for: rReq),
                (rResp as? HTTPURLResponse)?.statusCode == 200,
                let rawMd = String(data: rData.prefix(32768), encoding: .utf8) {
                 readmeExcerpt = cleanHFReadmeExcerpt(rawMd)
@@ -1585,12 +1570,7 @@ extension StudioViewModel {
                 )
                 return
             }
-            let safeName = "comfy_" + (item.filename as NSString).lastPathComponent
-            let dstURL = localSaveDir.appendingPathComponent(safeName)
-            if FileManager.default.fileExists(atPath: dstURL.path) {
-                try? FileManager.default.removeItem(at: dstURL)
-            }
-            try FileManager.default.moveItem(at: tmpURL, to: dstURL)
+            let dstURL = try LocalMediaDownload.save(tmpURL, filename: item.filename, in: localSaveDir, prefix: "comfy_")
             refreshLocalMedia()
             let ext = dstURL.pathExtension.lowercased()
             currentMediaURL = dstURL
@@ -1616,7 +1596,7 @@ extension StudioViewModel {
     }
 
     func regenerateApiKey() {
-        apiAccessKey = "sk-colab-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20).lowercased()
+        apiAccessKey = "sk-colab-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         Task { await syncApiKeyToColab() }
     }
 

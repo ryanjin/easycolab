@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from windows_app.client_io import save_media
 from windows_app.models import (
     IMAGE_RESOLUTIONS,
     MODEL_SPEC_MAP,
@@ -384,7 +385,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     "Not connected to Colab server. Please wake or connect a runtime first.",
                 ),
                 ("已退出当前 Google 账号。", "Signed out of Google account."),
-                ("已释放全部云端实例。", "All cloud runtimes released."),
+                ("请在 Colab 中确认实例状态。", "Check runtime status in Colab."),
                 ("云端实例已释放，本地状态已同步归零。", "Cloud runtime released; local state reset."),
                 ("已生成新的随机 API Key。", "Generated a new random API Key."),
                 ("请先输入提示词或对话内容。", "Please enter a prompt or message first."),
@@ -1329,14 +1330,11 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     def _download_media_to_local(self, base_url: str, rel_or_abs_url: str, filename: str, elapsed: Optional[float]) -> Optional[Path]:
         full_url = rel_or_abs_url if rel_or_abs_url.startswith("http") else f"{base_url}{rel_or_abs_url}"
-        save_dir = get_local_save_dir()
-        safe_name = Path(filename).name
-        dst = save_dir / safe_name
         r = self._admin_request("GET", full_url, timeout=180)
         if r.status_code == 200 and r.content:
-            dst.write_bytes(r.content)
+            dst = save_media(r.content, filename, get_local_save_dir())
             if elapsed is not None and elapsed > 0:
-                self.media_elapsed_map[safe_name] = float(elapsed)
+                self.media_elapsed_map[dst.name] = float(elapsed)
                 self._save_setting("mediaElapsedSecondsMap", self.media_elapsed_map)
             return dst
         return None

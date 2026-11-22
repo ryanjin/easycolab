@@ -1,11 +1,13 @@
 """Loopback ingress for the Gradio and Cloudflare tunnels on a Colab VM."""
 
 import contextlib
+import getpass
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -73,10 +75,22 @@ def nginx_config(directory):
     """
 
 
+def validate_management_password(password):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{24,256}", password):
+        raise ValueError("Management password must contain 24 to 256 URL-safe ASCII characters")
+    return password
+
+
+def deployment_password():
+    password = os.environ.pop("EASYCOLAB_ADMIN_PASSWORD", "")
+    if not password and sys.stdin.isatty():
+        password = getpass.getpass("Management password (24–256 URL-safe characters): ")
+    return validate_management_password(password)
+
+
 @contextlib.contextmanager
 def authenticated_ingress(password):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{24,256}", password):
-        raise ValueError("Management password must contain at least 24 URL-safe ASCII characters")
+    validate_management_password(password)
     nginx = shutil.which("nginx")
     if not nginx:
         raise RuntimeError("Install nginx on the runtime before starting EasyColab")

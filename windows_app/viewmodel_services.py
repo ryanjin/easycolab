@@ -20,9 +20,9 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-import requests
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from windows_app.client_io import hf_catalog_get, hf_catalog_hosts, save_media
 from windows_app.models import (
     IMAGE_RESOLUTIONS,
     MODEL_SPEC_MAP,
@@ -500,13 +500,13 @@ class ViewModelServicesMixin:
         self._active_generation_token = str(uuid.uuid4())
         self.is_generating = False
         self.status_message = tr(
-            "正在同步云盘数据并彻底销毁所有运行中的 Colab GPU 实例...",
-            "Syncing Google Drive & terminating all active Colab GPU runtimes...",
+            "正在释放 EasyColab 实例并查询账号用量...",
+            "Releasing EasyColab runtimes and checking account usage...",
         )
         self.append_console_line(
             tr(
-                "─── 正在断开并释放全部云端 GPU 实例 ───",
-                "─── Disconnecting & Releasing All Cloud GPU Runtimes ───",
+                "─── 正在断开并释放 EasyColab 实例 ───",
+                "─── Disconnecting & Releasing EasyColab Runtimes ───",
             )
         )
         self.state_changed.emit()
@@ -527,13 +527,15 @@ class ViewModelServicesMixin:
             def apply_ui() -> None:
                 self.is_releasing_colab = False
                 self.set_colab_server_url("")
-                raw_msg = str(data.get("message") or data.get("error") or tr("已释放全部云端实例。", "All cloud runtimes released."))
+                raw_msg = str(data.get("message") or data.get("error") or tr("请在 Colab 中确认实例状态。", "Check runtime status in Colab."))
                 msg = localize_server_text(strip_emoji(raw_msg))
                 self.reset_stale_remote_runtime_state(msg)
                 if data.get("paid_balance") is not None:
                     self.official_cu_balance = float(data["paid_balance"])
-                self.official_burn_rate = float(data.get("burn_rate_hourly") or 0.0)
-                self.active_vm_count = int(data.get("active_assignments") or 0)
+                if data.get("burn_rate_hourly") is not None:
+                    self.official_burn_rate = float(data["burn_rate_hourly"])
+                if data.get("active_assignments") is not None:
+                    self.active_vm_count = int(data["active_assignments"])
                 self.append_console_line(msg)
                 self.state_changed.emit()
 
@@ -725,10 +727,10 @@ class ViewModelServicesMixin:
                         params={
                             "category": cat,
                             "limit": 14,
-                            "hf_token": tok,
                             "force_refresh": "true" if force_refresh else "false",
                             "search_query": sq,
                         },
+                        headers={"X-HuggingFace-Token": tok} if tok else {},
                         timeout=12,
                     )
                     if r.status_code == 200:
@@ -762,16 +764,12 @@ class ViewModelServicesMixin:
                 else:
                     qpaths = [f"/api/models?sort=trendingScore&direction=-1&limit=22{search_qs}{expand_qs}"]
 
-                headers = {"User-Agent": "EasyColab-Windows/2.0", "Accept": "application/json"}
-                if tok:
-                    headers["Authorization"] = f"Bearer {tok}"
-
                 seen = set()
                 for qpath in qpaths:
                     raw_arr = None
-                    for host in ("https://huggingface.co", "https://hf-mirror.com"):
+                    for host in hf_catalog_hosts(tok):
                         try:
-                            resp = requests.get(f"{host}{qpath}", headers=headers, timeout=10)
+                            resp = hf_catalog_get(f"{host}{qpath}", token=tok, timeout=10)
                             if resp.status_code == 200 and isinstance(resp.json(), list):
                                 raw_arr = resp.json()
                                 break
@@ -858,7 +856,8 @@ class ViewModelServicesMixin:
                     r = self._admin_request(
                         "GET",
                         f"{base}/minimax_api/hf_model_detail",
-                        params={"repo_id": clean_id, "hf_token": tok},
+                        params={"repo_id": clean_id},
+                        headers={"X-HuggingFace-Token": tok} if tok else {},
                         timeout=14,
                     )
                     if r.status_code == 200:
@@ -870,14 +869,10 @@ class ViewModelServicesMixin:
                 except Exception:
                     pass
 
-            headers = {"User-Agent": "EasyColab-Windows/2.0", "Accept": "application/json"}
-            if tok:
-                headers["Authorization"] = f"Bearer {tok}"
-
             meta = None
-            for host in ("https://huggingface.co", "https://hf-mirror.com"):
+            for host in hf_catalog_hosts(tok):
                 try:
-                    resp = requests.get(f"{host}/api/models/{clean_id}?blobs=true", headers=headers, timeout=12)
+                    resp = hf_catalog_get(f"{host}/api/models/{clean_id}?blobs=true", token=tok, timeout=12)
                     if resp.status_code == 200 and isinstance(resp.json(), dict):
                         meta = resp.json()
                         break
@@ -970,9 +965,9 @@ class ViewModelServicesMixin:
             import re as _re
 
             readme_excerpt = ""
-            for host in ("https://huggingface.co", "https://hf-mirror.com"):
+            for host in hf_catalog_hosts(tok):
                 try:
-                    r_resp = requests.get(f"{host}/{rid}/raw/main/README.md", headers=headers, timeout=6)
+                    r_resp = hf_catalog_get(f"{host}/{rid}/raw/main/README.md", token=tok, timeout=6)
                     if r_resp.status_code == 200:
                         raw_md = r_resp.text[:32768]
                         if raw_md.startswith("---"):
@@ -1572,8 +1567,6 @@ class ViewModelServicesMixin:
             return
         encoded_rel = "/".join(urllib.parse.quote(seg, safe="") for seg in item.rel_path.split("/"))
         url = f"{base}/minimax_api/comfyui/output_media/{encoded_rel}"
-        save_name = "comfy_" + Path(item.filename).name
-        dst = get_local_save_dir() / save_name
         self.status_message = tr(
             f"正在从云端 ComfyUI 回传成片 {item.filename}...",
             f"Pulling output media {item.filename} from cloud ComfyUI...",
@@ -1584,7 +1577,7 @@ class ViewModelServicesMixin:
             try:
                 r = self._admin_request("GET", url, timeout=180)
                 if r.status_code == 200 and r.content:
-                    dst.write_bytes(r.content)
+                    dst = save_media(r.content, item.filename, get_local_save_dir(), prefix="comfy_")
 
                     def on_saved() -> None:
                         self.status_message = tr(

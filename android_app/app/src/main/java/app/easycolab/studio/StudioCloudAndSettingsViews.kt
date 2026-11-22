@@ -361,14 +361,7 @@ private fun ApiGatewayPanel(vm: StudioViewModel) {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(L("启用 API Key 鉴权保护", "Enable Bearer API Key Auth"), fontSize = 12.sp)
-            Switch(checked = vm.apiKeyEnabled, onCheckedChange = { vm.updateApiKeyEnabled(it) })
-        }
+        Text(L("推理接口需要 API Key", "Inference requests require an API key"), fontSize = 12.sp)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -914,6 +907,19 @@ fun CloudGpuTabScreen(vm: StudioViewModel) {
                         modifier = Modifier.fillMaxWidth()
                     )
 
+                    OutlinedTextField(
+                        value = vm.adminPassword,
+                        onValueChange = vm::updateAdminPassword,
+                        label = { Text(L("管理密码（用户名 easycolab）", "Management password (user easycolab)")) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    TextButton(
+                        enabled = vm.adminPassword.isNotEmpty(),
+                        onClick = { vm.copyToClipboard(context, "EasyColab", vm.adminPassword, L("已复制管理密码", "Management password copied")) }
+                    ) { Text(L("复制管理密码", "Copy management password")) }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1047,7 +1053,7 @@ fun CloudGpuTabScreen(vm: StudioViewModel) {
                         Icon(Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = L("断开并彻底释放全部云实例 (0 CU/h)", "Terminate All Cloud VMs (0 CU/h)"),
+                            text = if (vm.cliLoggedIn) L("释放本机创建的实例", "Release runtime created on this device") else L("关闭当前连接的实例", "Shut down connected runtime"),
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -1061,12 +1067,12 @@ fun CloudGpuTabScreen(vm: StudioViewModel) {
     if (vm.showDisconnectConfirm) {
         AlertDialog(
             onDismissRequest = { vm.showDisconnectConfirm = false },
-            title = { Text(L("确认释放全部云端实例？", "Terminate All Cloud Instances?")) },
+            title = { Text(if (vm.cliLoggedIn) L("释放本机创建的实例？", "Release the runtime created on this device?") else L("关闭当前实例？", "Shut down the connected runtime?")) },
             text = {
                 Text(
                     L(
-                        "将自动把 ComfyUI 新产出同步回 Google Drive，随后彻底销毁账号下所有活跃 Colab GPU 实例，使每小时 CU 扣费立即归零。",
-                        "Syncs ComfyUI outputs to Google Drive and unassigns all active Colab GPU runtimes so billing drops to 0.00 CU/h immediately."
+                        "释放后，实例本地存储的文件会消失。请先下载需要保留的作品。",
+                        "Files stored on the runtime are lost when it is released. Download any work you want to keep first."
                     )
                 )
             },

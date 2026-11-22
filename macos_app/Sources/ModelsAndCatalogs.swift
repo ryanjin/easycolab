@@ -1122,9 +1122,9 @@ struct StudioPalette {
 // MARK: - 跨环境动态路径与自包含运行支撑
 
 enum LocalRuntimePaths {
-    /// 若应用位于源码仓库目录 (<repo>/EasyColab.app)，优先读取仓库内文件以便开发热更新；
-    /// 若被独立安装至 /Applications，自动回退使用 EasyColab.app/Contents/Resources 内置资源。
+    // Only an unbundled development executable may look up resources in its checkout.
     static var repoRootIfPresent: URL? {
+        guard Bundle.main.bundleURL.pathExtension.lowercased() != "app" else { return nil }
         let fm = FileManager.default
         let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
         if fm.fileExists(atPath: bundleParent.appendingPathComponent("app.py").path),
@@ -1141,6 +1141,10 @@ enum LocalRuntimePaths {
 
     static func resolveBundledOrRepoFile(_ filename: String) -> String {
         let fm = FileManager.default
+        if Bundle.main.bundleURL.pathExtension.lowercased() == "app" {
+            let resources = Bundle.main.resourceURL ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
+            return resources.appendingPathComponent(filename).path
+        }
         if let repo = repoRootIfPresent {
             let p = repo.appendingPathComponent(filename).path
             if fm.fileExists(atPath: p) { return p }

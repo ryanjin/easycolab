@@ -323,6 +323,8 @@ swift_files = sorted(glob.glob(os.path.join(project_root, "ios_app", "Sources", 
 res_files = [
     os.path.join(project_root, "VERSION"),
     os.path.join(project_root, "app.py"),
+    os.path.join(project_root, "runtime_auth.py"),
+    os.path.join(project_root, "mobile_bootstrap.py"),
     os.path.join(project_root, "EasyColab_Server.ipynb"),
     os.path.join(proj_root, "Assets.xcassets"),
 ]

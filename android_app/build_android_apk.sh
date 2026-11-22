@@ -96,10 +96,12 @@ cp -f "${BUILT_APK}" "${OUTPUT_APK}"
 
 # 4. Verify bundled Colab server engine & APK v2 signature
 APK_ENTRIES="$(unzip -Z1 "${OUTPUT_APK}")"
-if ! grep -Fxq "assets/app.py" <<< "${APK_ENTRIES}"; then
-    echo "ERROR: assets/app.py missing from ${OUTPUT_APK}!" >&2
-    exit 1
-fi
+for asset in app.py runtime_auth.py mobile_bootstrap.py; do
+    if ! grep -Fxq "assets/${asset}" <<< "${APK_ENTRIES}"; then
+        echo "ERROR: assets/${asset} missing from ${OUTPUT_APK}!" >&2
+        exit 1
+    fi
+done
 
 APKSIGNER_BIN="$(find "${SDK_DIR}/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n 1 || true)"
 if [[ -n "${APKSIGNER_BIN}" && -x "${APKSIGNER_BIN}" ]]; then

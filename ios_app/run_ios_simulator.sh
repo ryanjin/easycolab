@@ -17,7 +17,7 @@ APP_BUNDLE="${SIM_BUILD_DIR}/${APP_NAME}.app"
 rm -rf "${SIM_BUILD_DIR}"
 mkdir -p "${APP_BUNDLE}"
 
-for res_file in "VERSION" "app.py" "EasyColab_Server.ipynb"; do
+for res_file in "VERSION" "app.py" "runtime_auth.py" "mobile_bootstrap.py" "EasyColab_Server.ipynb"; do
     if [ -f "${PROJECT_ROOT}/${res_file}" ]; then
         cp -f "${PROJECT_ROOT}/${res_file}" "${APP_BUNDLE}/${res_file}"
     fi
